@@ -122,6 +122,10 @@ Maintain a fast, reliable Markdown explorer for Ubuntu/Linux desktop with:
   numbering at the bottom of each page.
 - PDF export should preflight preview readiness (MathJax/Mermaid/fonts) before
   snapshotting, and apply print-focused math styling to avoid cramped glyphs.
+- `MIN_PRINT_DIAGRAM_FONT_PT` in `mdexplore.py` is the tweakable PDF
+  one-page shrink floor for diagram sizing decisions. Lowering it allows tall
+  diagrams (for example Mermaid activity/flowcharts) to stay on one page more
+  aggressively before the exporter falls back to multi-page spill.
 - In PDF mode, headed Mermaid and PlantUML sections should attach the heading
   to the diagram fence itself for pagination purposes, so Chromium cannot leave
   the heading on one page and push the diagram to the next.

@@ -50,6 +50,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+# Core runtime and document-behavior knobs live together here so PDF/layout
+# tuning does not end up scattered through the code or embedded JS.
 CONFIG_FILE_NAME = ".mdexplore.cfg"
 SEARCH_CLOSE_WORD_GAP = 50
 PDF_EXPORT_PRECHECK_MAX_ATTEMPTS = 60
@@ -65,6 +67,44 @@ RESTORE_OVERLAY_SHOW_DELAY_MS = 350
 RESTORE_OVERLAY_MAX_VISIBLE_SECONDS = 1.0
 MERMAID_BACKEND_JS = "js"
 MERMAID_BACKEND_RUST = "rust"
+# PDF print layout may shrink diagrams to keep them on one page. If the
+# resulting largest diagram font would fall below this floor, the diagram is
+# allowed to spill across pages instead. Lower this only if a smaller single-
+# page rendering is preferable to a multi-page spill.
+MIN_PRINT_DIAGRAM_FONT_PT = 3 # 2.4
+# The corresponding upper cap for print scaling. Diagrams may be shrunk more,
+# but they should never be enlarged beyond roughly this text size.
+MAX_PRINT_DIAGRAM_FONT_PT = 12.0
+# Vertical breathing room reserved between a heading cluster and its diagram.
+PDF_PRINT_HEADING_TO_DIAGRAM_GAP_PX = 16
+# Additional safety buffer left on the page so borderline fits do not clip when
+# Chromium computes the final print flow.
+PDF_PRINT_LAYOUT_SAFETY_PX = 40
+# Lower bound for the diagram area that is considered worth trying to keep on a
+# single page before immediately falling back to spill mode.
+PDF_PRINT_KEEP_MIN_HEIGHT_PX = 120
+# Letter page size expressed in CSS pixels for Chromium print layout math.
+PDF_PRINT_PORTRAIT_LETTER_WIDTH_PX = 1000 # 816
+PDF_PRINT_PORTRAIT_LETTER_HEIGHT_PX = 1310 # 1056
+PDF_PRINT_LANDSCAPE_LETTER_WIDTH_PX = 1100 # 1056
+PDF_PRINT_LANDSCAPE_LETTER_HEIGHT_PX = 860 # 816
+# Effective horizontal/vertical print margins removed from the page-size budget
+# when deciding whether a diagram can fit in portrait or landscape.
+PDF_PRINT_HORIZONTAL_MARGIN_PX = 80 # 96
+PDF_PRINT_VERTICAL_MARGIN_PX = 130 # 140
+# Floor values keep printable dimensions sane if the margin calculation would
+# otherwise leave an unrealistically small viewport for fit heuristics.
+PDF_PRINT_PORTRAIT_MIN_WIDTH_PX = 320 # 320
+PDF_PRINT_PORTRAIT_MIN_HEIGHT_PX = 320 # 320
+PDF_PRINT_LANDSCAPE_MIN_WIDTH_PX = 360 # 360
+PDF_PRINT_LANDSCAPE_MIN_HEIGHT_PX = 260 # 260
+# Wide diagrams become landscape candidates only when their aspect ratio and
+# expected width gain clear these thresholds.
+PDF_PRINT_WIDE_DIAGRAM_ASPECT_RATIO = 1.19 # 1.25
+PDF_PRINT_WIDE_DIAGRAM_LANDSCAPE_GAIN = 1.06 # 1.08
+# PlantUML tends to benefit from landscape a bit earlier than Mermaid, so it
+# has its own aspect-ratio threshold.
+PDF_PRINT_PLANTUML_LANDSCAPE_ASPECT_RATIO = 1.18 # 1.18
 # QWebEngineView.setHtml uses an internal data URL path with practical size
 # limits; large inline-SVG documents can fail to load. Use file-based loading
 # above this threshold.
@@ -76,12 +116,42 @@ def _config_file_path() -> Path:
 
 
 def _letter_pdf_page_layout() -> QPageLayout:
-    """Use explicit US Letter geometry so PDF export matches print preflight."""
+    """Fallback US Letter layout for callers that need an explicit page geometry."""
     return QPageLayout(
         QPageSize(QPageSize.PageSizeId.Letter),
         QPageLayout.Orientation.Portrait,
         QMarginsF(0.0, 0.0, 0.0, 0.0),
     )
+
+
+def _pdf_print_layout_knobs() -> dict[str, float | int]:
+    """Expose PDF print-layout policy knobs to the in-page preflight JS.
+
+    The hidden QWebEngine preview performs the final pagination classification
+    because only the DOM knows the rendered heading heights and intrinsic SVG
+    geometry. Keeping the knobs here ensures that policy changes stay in Python
+    instead of drifting into anonymous literals inside the embedded template.
+    """
+    return {
+        "headingToDiagramGapPx": PDF_PRINT_HEADING_TO_DIAGRAM_GAP_PX,
+        "layoutSafetyPx": PDF_PRINT_LAYOUT_SAFETY_PX,
+        "keepMinHeightPx": PDF_PRINT_KEEP_MIN_HEIGHT_PX,
+        "minPrintDiagramFontPt": MIN_PRINT_DIAGRAM_FONT_PT,
+        "maxPrintDiagramFontPt": MAX_PRINT_DIAGRAM_FONT_PT,
+        "portraitLetterWidthPx": PDF_PRINT_PORTRAIT_LETTER_WIDTH_PX,
+        "portraitLetterHeightPx": PDF_PRINT_PORTRAIT_LETTER_HEIGHT_PX,
+        "landscapeLetterWidthPx": PDF_PRINT_LANDSCAPE_LETTER_WIDTH_PX,
+        "landscapeLetterHeightPx": PDF_PRINT_LANDSCAPE_LETTER_HEIGHT_PX,
+        "horizontalMarginPx": PDF_PRINT_HORIZONTAL_MARGIN_PX,
+        "verticalMarginPx": PDF_PRINT_VERTICAL_MARGIN_PX,
+        "portraitMinWidthPx": PDF_PRINT_PORTRAIT_MIN_WIDTH_PX,
+        "portraitMinHeightPx": PDF_PRINT_PORTRAIT_MIN_HEIGHT_PX,
+        "landscapeMinWidthPx": PDF_PRINT_LANDSCAPE_MIN_WIDTH_PX,
+        "landscapeMinHeightPx": PDF_PRINT_LANDSCAPE_MIN_HEIGHT_PX,
+        "wideDiagramAspectRatio": PDF_PRINT_WIDE_DIAGRAM_ASPECT_RATIO,
+        "wideDiagramLandscapeGain": PDF_PRINT_WIDE_DIAGRAM_LANDSCAPE_GAIN,
+        "plantumlLandscapeAspectRatio": PDF_PRINT_PLANTUML_LANDSCAPE_ASPECT_RATIO,
+    }
 
 
 def _load_default_root_from_config() -> Path:
@@ -121,7 +191,7 @@ def _extract_plantuml_error_details(stderr_text: str) -> str:
     return "\n".join(lines[:8])
 
 
-def _stamp_pdf_page_numbers(pdf_bytes: bytes) -> bytes:
+def _stamp_pdf_page_numbers(pdf_bytes: bytes, layout_hints: dict[str, object] | None = None) -> bytes:
     """Overlay centered `N of M` footers on every page of a PDF payload."""
     if not pdf_bytes:
         raise ValueError("Empty PDF payload")
@@ -137,13 +207,125 @@ def _stamp_pdf_page_numbers(pdf_bytes: bytes) -> bytes:
         raise RuntimeError("Missing dependency 'reportlab' for PDF page numbering") from exc
 
     reader = PdfReader(BytesIO(pdf_bytes))
+    layout_hints = layout_hints if isinstance(layout_hints, dict) else {}
 
-    def page_has_meaningful_content(page) -> bool:
-        """Suppress fully blank pages before footer numbering is applied."""
+    def normalize_text(value: str) -> str:
+        return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
+
+    landscape_headings = {
+        normalize_text(item)
+        for item in (layout_hints.get("landscapeHeadings") or [])
+        if str(item or "").strip()
+    }
+    diagram_headings = {
+        normalize_text(item)
+        for item in (layout_hints.get("diagramHeadings") or [])
+        if str(item or "").strip()
+    }
+
+    def page_text(page) -> str:
         try:
-            text = (page.extract_text() or "").strip()
+            return page.extract_text() or ""
         except Exception:
-            text = ""
+            return ""
+
+    raw_page_texts = [page_text(page) for page in reader.pages]
+    normalized_page_texts = [normalize_text(text) for text in raw_page_texts]
+    landscape_token = normalize_text("__MDEXPLORE_LANDSCAPE_PAGE__")
+    landscape_flags = [
+        (landscape_token in page_text) or any(heading and heading in page_text for heading in landscape_headings)
+        for page_text in normalized_page_texts
+    ]
+    diagram_page_flags = [
+        any(heading and heading in page_text for heading in diagram_headings)
+        for page_text in normalized_page_texts
+    ]
+
+    def raster_page_bounds() -> list[tuple[float, float, float, float] | None]:
+        if not reader.pages:
+            return []
+        try:
+            import shutil
+            import subprocess
+            import tempfile
+            from pathlib import Path
+            from PIL import Image
+        except Exception:
+            return [None] * len(reader.pages)
+
+        if shutil.which("pdftoppm") is None:
+            return [None] * len(reader.pages)
+
+        try:
+            with tempfile.TemporaryDirectory(prefix="mdexplore-pdf-bounds-") as tmpdir_str:
+                tmpdir = Path(tmpdir_str)
+                pdf_path = tmpdir / "input.pdf"
+                prefix = tmpdir / "page"
+                pdf_path.write_bytes(pdf_bytes)
+                result = subprocess.run(
+                    ["pdftoppm", "-png", "-r", "72", str(pdf_path), str(prefix)],
+                    capture_output=True,
+                    check=False,
+                    timeout=60,
+                )
+                if result.returncode != 0:
+                    return [None] * len(reader.pages)
+
+                bounds_by_index: list[tuple[float, float, float, float] | None] = [None] * len(reader.pages)
+                image_paths = sorted(tmpdir.glob("page-*.png"))
+                for image_path in image_paths:
+                    match = re.search(r"-(\d+)\.png$", image_path.name)
+                    if not match:
+                        continue
+                    page_index = int(match.group(1)) - 1
+                    if page_index < 0 or page_index >= len(reader.pages):
+                        continue
+                    image = Image.open(image_path).convert("RGB")
+                    width_px, height_px = image.size
+                    if width_px <= 0 or height_px <= 0:
+                        continue
+                    pixels = image.load()
+                    minx, miny = width_px, height_px
+                    maxx = maxy = -1
+                    for y in range(height_px):
+                        for x in range(width_px):
+                            r, g, b = pixels[x, y]
+                            if r < 247 or g < 247 or b < 247:
+                                if x < minx:
+                                    minx = x
+                                if y < miny:
+                                    miny = y
+                                if x > maxx:
+                                    maxx = x
+                                if y > maxy:
+                                    maxy = y
+                    if maxx < 0 or maxy < 0:
+                        continue
+                    pad_x = max(4, int((maxx - minx + 1) * 0.025))
+                    pad_y = max(4, int((maxy - miny + 1) * 0.025))
+                    minx = max(0, minx - pad_x)
+                    miny = max(0, miny - pad_y)
+                    maxx = min(width_px - 1, maxx + pad_x)
+                    maxy = min(height_px - 1, maxy + pad_y)
+                    page = reader.pages[page_index]
+                    page_width = float(page.mediabox.width)
+                    page_height = float(page.mediabox.height)
+                    crop_left = (minx / width_px) * page_width
+                    crop_right = ((maxx + 1) / width_px) * page_width
+                    crop_top = (miny / height_px) * page_height
+                    crop_bottom = ((maxy + 1) / height_px) * page_height
+                    lower_y = max(0.0, page_height - crop_bottom)
+                    upper_y = min(page_height, page_height - crop_top)
+                    bounds_by_index[page_index] = (crop_left, lower_y, crop_right, upper_y)
+                return bounds_by_index
+        except Exception:
+            return [None] * len(reader.pages)
+
+    crop_bounds_by_page = raster_page_bounds()
+
+    def page_has_meaningful_content(page, extracted_text: str) -> bool:
+        """Suppress fully blank pages before footer numbering is applied."""
+        text = extracted_text.strip()
         if text:
             return True
 
@@ -208,18 +390,36 @@ def _stamp_pdf_page_numbers(pdf_bytes: bytes) -> bytes:
 
         return False
 
-    kept_pages = [page for page in reader.pages if page_has_meaningful_content(page)]
-    if not kept_pages:
-        kept_pages = list(reader.pages)
+    kept_page_records = [
+        (page, landscape, is_diagram_page, crop_bounds)
+        for page, landscape, is_diagram_page, crop_bounds, extracted_text in zip(
+            reader.pages,
+            landscape_flags,
+            diagram_page_flags,
+            crop_bounds_by_page,
+            raw_page_texts,
+        )
+        if page_has_meaningful_content(page, extracted_text)
+    ]
+    if not kept_page_records:
+        kept_page_records = [
+            (page, landscape, is_diagram_page, crop_bounds)
+            for page, landscape, is_diagram_page, crop_bounds in zip(
+                reader.pages,
+                landscape_flags,
+                diagram_page_flags,
+                crop_bounds_by_page,
+            )
+        ]
 
-    page_total = len(kept_pages)
+    page_total = len(kept_page_records)
     if page_total <= 0:
         raise RuntimeError("Generated PDF has no pages")
 
     def estimate_majority_font_size() -> float:
         """Infer dominant body font size from PDF text operators."""
         size_counts: dict[float, int] = {}
-        for page in kept_pages[: min(5, page_total)]:
+        for page, _is_landscape, _is_diagram_page, _crop_bounds in kept_page_records[: min(5, page_total)]:
             try:
                 contents = page.get_contents()
             except Exception:
@@ -249,50 +449,110 @@ def _stamp_pdf_page_numbers(pdf_bytes: bytes) -> bytes:
             return 10.5
         return max(size_counts.items(), key=lambda item: (item[1], -abs(item[0] - 11.0)))[0]
 
+    def estimate_page_diagram_font_size(page) -> float:
+        """Approximate the largest non-heading font size used on a page."""
+        try:
+            contents = page.get_contents()
+        except Exception:
+            contents = None
+        if contents is None:
+            return 0.0
+
+        candidate_sizes: list[float] = []
+        streams = contents if isinstance(contents, list) else [contents]
+        for stream in streams:
+            try:
+                raw = stream.get_data()
+            except Exception:
+                continue
+            if not raw:
+                continue
+            text = raw.decode("latin-1", errors="ignore")
+            for match in re.finditer(r"([0-9]+(?:\\.[0-9]+)?)\\s+Tf\\b", text):
+                try:
+                    size = float(match.group(1))
+                except Exception:
+                    continue
+                if 6.0 <= size <= 20.0:
+                    candidate_sizes.append(size)
+        if not candidate_sizes:
+            return 0.0
+        return max(candidate_sizes)
+
     base_body_font_size = estimate_majority_font_size()
 
     writer = PdfWriter()
-    for page_number, page in enumerate(kept_pages, start=1):
-        width = float(page.mediabox.width)
-        height = float(page.mediabox.height)
-        if width <= 0 or height <= 0:
+    for page_number, (page, is_landscape_page, is_diagram_page, crop_bounds) in enumerate(kept_page_records, start=1):
+        source_width = float(page.mediabox.width)
+        source_height = float(page.mediabox.height)
+        if source_width <= 0 or source_height <= 0:
             writer.add_page(page)
             continue
 
+        crop_left = crop_bottom = 0.0
+        crop_right = source_width
+        crop_top = source_height
+        if crop_bounds is not None and (is_diagram_page or is_landscape_page):
+            crop_left, crop_bottom, crop_right, crop_top = crop_bounds
+            crop_left = max(0.0, min(source_width - 1.0, crop_left))
+            crop_right = max(crop_left + 1.0, min(source_width, crop_right))
+            crop_bottom = max(0.0, min(source_height - 1.0, crop_bottom))
+            crop_top = max(crop_bottom + 1.0, min(source_height, crop_top))
+
+        content_source_width = crop_right - crop_left
+        content_source_height = crop_top - crop_bottom
+
+        page_width = source_height if is_landscape_page else source_width
+        page_height = source_width if is_landscape_page else source_height
+
         # Fit rendered content into a print-style content box with explicit
         # top/side margins plus a dedicated footer band for page numbers.
-        side_margin = max(34.0, min(width * 0.12, base_body_font_size * 4.2))
-        top_margin = max(30.0, min(height * 0.10, base_body_font_size * 3.8))
-        footer_band_height = max(42.0, min(height * 0.16, base_body_font_size * 4.4))
-        content_box_width = max(72.0, width - (2.0 * side_margin))
-        content_box_height = max(72.0, height - top_margin - footer_band_height)
+        side_margin = max(34.0, min(page_width * 0.12, base_body_font_size * 4.2))
+        top_margin = max(30.0, min(page_height * 0.10, base_body_font_size * 3.8))
+        footer_band_height = max(42.0, min(page_height * 0.16, base_body_font_size * 4.4))
+        content_box_width = max(72.0, page_width - (2.0 * side_margin))
+        content_box_height = max(72.0, page_height - top_margin - footer_band_height)
 
+        max_safe_scale = 1.0
+        if is_diagram_page or is_landscape_page:
+            page_diagram_font_size = estimate_page_diagram_font_size(page)
+            if page_diagram_font_size > 0:
+                max_safe_scale = max(1.0, min(2.75, 16.0 / page_diagram_font_size))
+            else:
+                max_safe_scale = 2.75 if is_landscape_page else 1.8
         content_scale = min(
-            1.0,
-            content_box_width / width,
-            content_box_height / height,
+            max_safe_scale,
+            content_box_width / content_source_width,
+            content_box_height / content_source_height,
         )
-        content_width = width * content_scale
-        content_height = height * content_scale
+        content_width = content_source_width * content_scale
+        content_height = content_source_height * content_scale
         content_translate_x = side_margin + max(0.0, (content_box_width - content_width) / 2.0)
         content_translate_y = footer_band_height + max(0.0, (content_box_height - content_height) / 2.0)
 
-        composed_page = PageObject.create_blank_page(width=width, height=height)
-        transform = Transformation().scale(content_scale, content_scale).translate(
-            content_translate_x,
-            content_translate_y,
-        )
+        composed_page = PageObject.create_blank_page(width=page_width, height=page_height)
+        if is_landscape_page:
+            transform = (
+                Transformation()
+                .scale(content_scale, content_scale)
+                .translate(content_translate_x - (crop_left * content_scale), content_translate_y - (crop_bottom * content_scale))
+            )
+        else:
+            transform = Transformation().scale(content_scale, content_scale).translate(
+                content_translate_x - (crop_left * content_scale),
+                content_translate_y - (crop_bottom * content_scale),
+            )
         composed_page.merge_transformed_page(page, transform, over=True)
 
         footer_font_size = max(8.0, min(14.0, base_body_font_size * content_scale))
         footer_baseline_y = max(12.0, (footer_band_height - footer_font_size) / 2.0)
 
         overlay_buffer = BytesIO()
-        footer_canvas = canvas.Canvas(overlay_buffer, pagesize=(width, height))
+        footer_canvas = canvas.Canvas(overlay_buffer, pagesize=(page_width, page_height))
         footer_canvas.setFont("Helvetica", footer_font_size)
         footer_text = f"{page_number} of {page_total}"
         footer_width = footer_canvas.stringWidth(footer_text, "Helvetica", footer_font_size)
-        x = max(0.0, (width - footer_width) / 2.0)
+        x = max(0.0, (page_width - footer_width) / 2.0)
         footer_canvas.drawString(x, footer_baseline_y, footer_text)
         footer_canvas.save()
 
@@ -520,6 +780,8 @@ class ColorizedMarkdownModel(QFileSystemModel):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
+        # Cache both persistence data and the small finite set of tree icons so
+        # the view stays responsive even in large directories.
         self._dir_color_map: dict[str, dict[str, str]] = {}
         self._loaded_dirs: set[str] = set()
         self._search_match_paths: set[str] = set()
@@ -532,7 +794,8 @@ class ColorizedMarkdownModel(QFileSystemModel):
         self._decorated_icon_cache: dict[tuple[bool, bool], QIcon] = {}
 
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):
-        # Paint colorized markdown rows without affecting directories.
+        # This model only customizes markdown files; directories continue to use
+        # QFileSystemModel defaults so tree navigation behavior remains native.
         if role == Qt.ItemDataRole.DecorationRole:
             info = self.fileInfo(index)
             if info.isFile() and info.suffix().lower() == "md":
@@ -734,6 +997,8 @@ class MarkdownRenderer:
     """Converts markdown to HTML with Mermaid, MathJax, and PlantUML support."""
 
     def __init__(self, mermaid_backend: str = MERMAID_BACKEND_JS) -> None:
+        # Backend selection is resolved once per renderer so the markdown fence
+        # callbacks can stay simple and deterministic.
         self._mermaid_backend_requested = str(mermaid_backend or MERMAID_BACKEND_JS).strip().lower()
         if self._mermaid_backend_requested not in {MERMAID_BACKEND_JS, MERMAID_BACKEND_RUST}:
             self._mermaid_backend_requested = MERMAID_BACKEND_JS
@@ -776,7 +1041,8 @@ class MarkdownRenderer:
 
         def custom_fence(tokens, idx, options, env):
             # Intercept known diagram fences and delegate the rest to the
-            # default fenced-code renderer.
+            # default fenced-code renderer. This is the only place where raw
+            # markdown fence language is turned into preview/PDF placeholders.
             token = tokens[idx]
             info = token.info.strip().split(maxsplit=1)[0].lower() if token.info else ""
             code = token.content
@@ -786,12 +1052,18 @@ class MarkdownRenderer:
 
             if info == "mermaid":
                 try:
+                    # All Mermaid flows start by normalizing source and hashing
+                    # it. The hash is the cache key shared by preview, restore,
+                    # and PDF-specific SVG variants.
                     prepared_source = self._prepare_mermaid_source(code)
                     mermaid_hash = hashlib.sha1(prepared_source.encode("utf-8", errors="replace")).hexdigest()
                     mermaid_index = int(env.get("mermaid_index", 0)) if isinstance(env, dict) else 0
                     if isinstance(env, dict):
                         env["mermaid_index"] = mermaid_index + 1
                     if self._mermaid_backend == MERMAID_BACKEND_RUST:
+                        # Rust preview and PDF SVGs intentionally fork here:
+                        # preview gets mdexplore's GUI profile, while PDF gets
+                        # a separate vanilla render cached for export only.
                         svg_markup, error_message = self._render_mermaid_svg_markup(prepared_source, "preview")
                         if isinstance(env, dict):
                             pdf_svg_map = env.get("mermaid_pdf_svg_by_hash")
@@ -836,6 +1108,9 @@ class MarkdownRenderer:
                     )
 
             if info in {"plantuml", "puml", "uml"}:
+                # PlantUML takes a different path because preview rendering is
+                # progressive and may complete after the rest of the markdown is
+                # already visible.
                 resolver = env.get("plantuml_resolver") if isinstance(env, dict) else None
                 if callable(resolver):
                     plantuml_index = int(env.get("plantuml_index", 0))
@@ -1880,6 +2155,9 @@ class MarkdownRenderer:
     }}
   </style>
   <script>
+    // Preview bootstrap state shared across Python -> JS round-trips. Python
+    // seeds caches and persisted diagram viewport state into the page so GUI
+    // restores and PDF export can reuse the same rendered artifacts.
     window.MathJax = {{
       startup: {{
         typeset: false
@@ -1940,6 +2218,8 @@ class MarkdownRenderer:
       return {{}};
     }})();
     window.__mdexploreGetDiagramViewState = (stateKey) => {{
+      // Return a normalized diagram state payload; callers rely on finite
+      // numbers here because the result may be persisted back to Python.
       const key = String(stateKey || "").trim();
       if (!key) {{
         return null;
@@ -1963,6 +2243,8 @@ class MarkdownRenderer:
       }};
     }};
     window.__mdexploreSetDiagramViewState = (stateKey, rawState) => {{
+      // Diagram zoom/pan is stored per-hash/per-index so view tabs for the same
+      // document can restore independent scroll positions.
       const key = String(stateKey || "").trim();
       if (!key) {{
         return;
@@ -1981,6 +2263,8 @@ class MarkdownRenderer:
       }};
     }};
     window.__mdexploreCollectDiagramViewState = () => {{
+      // Called from Python before document switches and PDF export. The result
+      // becomes the persisted in-memory diagram-state map for the current run.
       const source = window.__mdexploreDiagramViewState;
       if (!source || typeof source !== "object") {{
         return {{}};
@@ -2001,6 +2285,9 @@ class MarkdownRenderer:
     }};
 
     window.__mdexploreLoadMathJaxScript = () => {{
+      // MathJax and Mermaid both use local-first fallback chains because the
+      // app must work offline when vendor assets are present but still recover
+      // gracefully with CDN sources when they are not.
       if (window.__mdexploreMathJaxLoadPromise) {{
         return window.__mdexploreMathJaxLoadPromise;
       }}
@@ -2059,6 +2346,8 @@ class MarkdownRenderer:
     }};
 
     window.__mdexploreClearPdfExportMode = () => {{
+      // PDF export temporarily mutates DOM/theme state. Always provide a
+      // single cleanup entry point so post-export GUI restore is predictable.
       try {{
         if (document.documentElement) {{
           document.documentElement.classList.remove("mdexplore-pdf-export-mode");
@@ -2108,6 +2397,8 @@ class MarkdownRenderer:
     }};
 
     window.__mdexploreApproxTopVisibleLine = () => {{
+      // Approximate the source line nearest the top of the viewport using the
+      // source-line tags injected by MarkdownRenderer.
       const probeX = Math.max(14, Math.floor(window.innerWidth * 0.42));
       const probeYs = [10, 20, 34, 50, 72, 96];
       for (const y of probeYs) {{
@@ -2129,6 +2420,9 @@ class MarkdownRenderer:
     }};
 
     window.__mdexploreInstallScrollLineIndicator = () => {{
+      // This installs both scrollbar-adjacent UI features:
+      // 1. live "current / total" line indicator while dragging the scrollbar
+      // 2. yellow search-hit markers that can be clicked to jump within a doc
       if (window.__mdexploreScrollLineIndicatorInstalled) {{
         return;
       }}
@@ -2182,6 +2476,8 @@ class MarkdownRenderer:
       }};
 
       const updateIndicator = () => {{
+        // The indicator is positioned from the actual scrollbar/viewport
+        // geometry rather than from guessed margins so it tracks the handle.
         if (!indicator.isConnected) {{
           return;
         }}
@@ -2232,6 +2528,8 @@ class MarkdownRenderer:
       }};
 
       const refreshSearchHitMarkers = () => {{
+        // Build a compact map of highlighted search results along the document
+        // height. Nearby hits are merged into clusters to avoid a solid strip.
         if (!hitOverlay.isConnected) {{
           return;
         }}
@@ -2454,6 +2752,9 @@ class MarkdownRenderer:
     }};
 
     window.__mdexploreMermaidInitConfig = (mode = "auto") => {{
+      // Mermaid is configured twice: an interactive preview palette and a
+      // deliberately plain PDF palette. The PDF path is later normalized to
+      // grayscale/print-safe contrast and must not inherit preview tuning.
       const usePdfMode = String(mode || "").toLowerCase() === "pdf";
       const dark = !usePdfMode && window.__mdexploreIsDarkBackground();
       const shared = {{
@@ -2566,6 +2867,9 @@ class MarkdownRenderer:
       }};
     }};
 
+    // Mermaid subtype matters for interaction and print layout because
+    // sequence, ER, class, and flowchart diagrams have very different
+    // geometry and typography tradeoffs.
     window.__mdexploreDetectMermaidKind = (sourceText) => {{
       const text = String(sourceText || "");
       if (/^\\s*sequenceDiagram\\b/im.test(text)) {{
@@ -2583,6 +2887,8 @@ class MarkdownRenderer:
       return "";
     }};
 
+    // Wrap Mermaid SVG output in an interactive shell that adds fit/zoom/pan
+    // controls without mutating the underlying cached SVG markup.
     window.__mdexploreApplyMermaidZoomControls = (block, mode = "auto") => {{
       if (!(block instanceof HTMLElement)) {{
         return;
@@ -2630,6 +2936,8 @@ class MarkdownRenderer:
         return;
       }}
 
+      // The shell operates in intrinsic SVG coordinates, so all geometry
+      // helpers normalize whatever sizing hints the renderer emitted.
       const parseViewBox = (svgNode) => {{
         const viewBoxText = String(svgNode.getAttribute("viewBox") || "").trim();
         const parts = viewBoxText
@@ -2647,6 +2955,9 @@ class MarkdownRenderer:
         return null;
       }};
 
+      // Some Mermaid outputs include generous whitespace in the original
+      // viewBox. Tightening that once improves fit/zoom behavior and keeps the
+      // initial "Fit" action visually sensible.
       const tightenSvgViewBoxWhitespace = (svgNode) => {{
         if (!(svgNode instanceof SVGElement)) {{
           return;
@@ -2703,6 +3014,8 @@ class MarkdownRenderer:
         }}
       }};
 
+      // Establish a stable intrinsic size before viewport math starts so zoom
+      // state restore behaves consistently across revisits and rerenders.
       const parseBaseSize = (svgNode) => {{
         const parsedViewBox = parseViewBox(svgNode);
         if (parsedViewBox) {{
@@ -2749,6 +3062,8 @@ class MarkdownRenderer:
         }};
       }};
 
+      // Toolbar + viewport form the reusable interactive shell around each
+      // Mermaid block in GUI mode.
       const shell = document.createElement("div");
       shell.className = "mdexplore-mermaid-shell";
       shell.dataset.mdexploreStateKey = stateKey;
@@ -4925,10 +5240,17 @@ class MarkdownRenderer:
       return updated;
     }};
 
+    // Mermaid rendering has two very different backends:
+    // - JS: client-side render and cache by mode
+    // - Rust: server-side/pre-rendered SVG with optional JS fallback in GUI
+    // This function keeps those forks isolated while still exposing one entry
+    // point to the rest of the preview lifecycle.
     window.__mdexploreRunMermaidWithMode = async (mode = "auto", force = false) => {{
       const normalizedMode = String(mode || "").toLowerCase() === "pdf" ? "pdf" : "auto";
       const backend = String(window.__mdexploreMermaidBackend || "js").toLowerCase();
       if (backend === "rust") {{
+        // Rust mode prefers pre-rendered SVG injected by Python. GUI mode can
+        // optionally fall back to Mermaid JS if Rust output is unavailable.
         const mermaidBlocks = Array.from(document.querySelectorAll(".mermaid"));
         const fallbackBlocks = [];
         const disableRustJsFallback = !!window.__mdexploreDisableRustJsFallback;
@@ -4952,6 +5274,8 @@ class MarkdownRenderer:
             }}
           }}
           if (normalizedMode === "pdf" && hashKey && modeCache && typeof modeCache[hashKey] === "string") {{
+            // PDF mode must use the dedicated PDF cache so GUI palette tweaks
+            // never leak into exported output.
             const cachedSvg = modeCache[hashKey];
             if (cachedSvg.indexOf("<svg") >= 0) {{
               block.innerHTML = cachedSvg;
@@ -4961,6 +5285,8 @@ class MarkdownRenderer:
             }}
           }}
           if (normalizedMode !== "pdf" && force && hashKey && modeCache && typeof modeCache[hashKey] === "string") {{
+            // Force-refresh in GUI mode still starts from cached auto SVG when
+            // possible so a PDF round-trip can restore the preview quickly.
             const cachedSvg = modeCache[hashKey];
             if (cachedSvg.indexOf("<svg") >= 0) {{
               block.innerHTML = cachedSvg;
@@ -5095,6 +5421,8 @@ class MarkdownRenderer:
       }}
       window.__mdexploreMermaidAttempted = true;
       window.__mdexploreMermaidRenderMode = normalizedMode;
+      // Only one JS Mermaid render pass should run at a time; later callers
+      // await the in-flight promise instead of duplicating work.
       window.__mdexploreMermaidRenderPromise = (async () => {{
         try {{
           const loaded = await window.__mdexploreLoadMermaidScript();
@@ -5227,6 +5555,8 @@ class MarkdownRenderer:
       return window.__mdexploreRunMermaidWithMode("auto", false);
     }};
 
+    // Math typesetting is retried independently of Mermaid so one subsystem
+    // failing or loading slowly does not stall the other.
     window.__mdexploreTryTypesetMath = async () => {{
       if (window.__mdexploreMathInFlight) {{
         return window.__mdexploreMathReady;
@@ -5268,6 +5598,9 @@ class MarkdownRenderer:
       }}
     }};
 
+    // Main preview bootstrap: normalize callouts, render Mermaid/PlantUML
+    // affordances, then typeset math. PDF mode uses the same entry point with
+    // a different Mermaid mode.
     window.__mdexploreRunClientRenderers = async (options = null) => {{
       if (window.__mdexploreTransformCallouts) {{
         window.__mdexploreTransformCallouts();
@@ -5342,7 +5675,8 @@ class PreviewRenderWorker(QRunnable):
 
     def run(self) -> None:
         try:
-            # Keep this fully self-contained so it is safe to run off-thread.
+            # Keep this fully self-contained so it is safe to run off-thread and
+            # so renderer state cannot leak across requests.
             resolved = self.path.resolve()
             stat = resolved.stat()
             markdown_text = resolved.read_text(encoding="utf-8", errors="replace")
@@ -5380,6 +5714,8 @@ class PlantUmlRenderWorker(QRunnable):
         self.signals = PlantUmlRenderWorkerSignals()
 
     def run(self) -> None:
+        # Fast-fail setup problems before spawning Java so the UI gets a useful
+        # error quickly and worker threads are not wasted.
         if self.setup_issue is not None:
             self.signals.finished.emit(self.hash_key, "error", self.setup_issue)
             return
@@ -5440,15 +5776,16 @@ class PdfExportWorkerSignals(QObject):
 class PdfExportWorker(QRunnable):
     """Apply footer page numbers and write exported PDF in background."""
 
-    def __init__(self, output_path: Path, pdf_bytes: bytes):
+    def __init__(self, output_path: Path, pdf_bytes: bytes, layout_hints: dict[str, object] | None = None):
         super().__init__()
         self.output_path = output_path
         self.pdf_bytes = pdf_bytes
+        self.layout_hints = layout_hints if isinstance(layout_hints, dict) else {}
         self.signals = PdfExportWorkerSignals()
 
     def run(self) -> None:
         try:
-            stamped_pdf = _stamp_pdf_page_numbers(self.pdf_bytes)
+            stamped_pdf = _stamp_pdf_page_numbers(self.pdf_bytes, self.layout_hints)
             self.output_path.write_bytes(stamped_pdf)
             self.signals.finished.emit(str(self.output_path), "")
         except Exception as exc:
@@ -5478,6 +5815,8 @@ class ViewTabBar(QTabBar):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        # Drag state is tracked here instead of relying on Qt's default drag
+        # ghost so the whole tab, not just the close button, appears to move.
         self._drag_candidate_index = -1
         self._drag_start_pos = None
         self._dragging_index = -1
@@ -5806,6 +6145,11 @@ class MdExploreWindow(QMainWindow):
 
     def __init__(self, root: Path, app_icon: QIcon, config_path: Path, mermaid_backend: str = MERMAID_BACKEND_JS):
         super().__init__()
+        # Persistent document/session state is split deliberately:
+        # - cache: rendered HTML keyed by file + stat signature
+        # - preview scrolls: per-run only
+        # - document view sessions: per-run
+        # - persisted view sessions: on-disk per-directory sidecars
         self.root = root.resolve()
         self.config_path = config_path
         self.renderer = MarkdownRenderer(mermaid_backend=mermaid_backend)
@@ -5828,6 +6172,7 @@ class MdExploreWindow(QMainWindow):
         self._active_pdf_workers: set[PdfExportWorker] = set()
         self._pdf_export_in_progress = False
         self._pdf_export_source_key: str | None = None
+        self._pending_pdf_layout_hints: dict[str, object] = {}
         # Global, in-process result cache for PlantUML blocks keyed by hash of
         # normalized source. This survives file navigation during this run.
         self._plantuml_results: dict[str, tuple[str, str]] = {}
@@ -5864,6 +6209,8 @@ class MdExploreWindow(QMainWindow):
         self._view_line_probe_pending = False
         self._last_view_line_probe_at = 0.0
         self._match_input_text = ""
+        # Search is debounced so filesystem/content scans do not run on every
+        # keystroke while the user is still typing an expression.
         self.match_timer = QTimer(self)
         self.match_timer.setSingleShot(True)
         self.match_timer.setInterval(1000)
@@ -5872,6 +6219,9 @@ class MdExploreWindow(QMainWindow):
         self._scroll_capture_timer.setInterval(200)
         self._scroll_capture_timer.timeout.connect(self._capture_current_preview_scroll)
         self._scroll_capture_timer.start()
+        # Diagram view-state capture is kept separate from normal scroll capture
+        # because Mermaid/PlantUML maintain their own zoom/pan state inside the
+        # embedded page.
         self._diagram_state_capture_timer = QTimer(self)
         self._diagram_state_capture_timer.setInterval(250)
         self._diagram_state_capture_timer.timeout.connect(self._on_diagram_state_capture_tick)
@@ -5962,6 +6312,8 @@ class MdExploreWindow(QMainWindow):
         self._reset_document_views()
         self._refresh_tree_multi_view_markers()
 
+        # Top-left document controls operate on directory scope and current file
+        # scope; the right side hosts clipboard/search operations.
         self.up_btn = QPushButton("^")
         self.up_btn.clicked.connect(self._go_up_directory)
 
@@ -6013,6 +6365,8 @@ class MdExploreWindow(QMainWindow):
             )
             copy_buttons_layout.addWidget(color_btn)
 
+        # Search UI stays in the toolbar so tree filtering/highlighting remains
+        # visible while the preview reacts in the right pane.
         match_label = QLabel("Search and highlight: ")
         self.match_input = QLineEdit()
         self.match_input.setClearButtonEnabled(False)
@@ -10369,6 +10723,7 @@ class MdExploreWindow(QMainWindow):
         source_key = str(source_path)
         output_path = source_path.with_suffix(".pdf")
         self._pdf_export_source_key = source_key
+        self._pending_pdf_layout_hints = {}
         # Preserve current diagram zoom/pan before forcing PDF-safe rendering mode.
         self._capture_current_diagram_view_state_blocking(source_key, timeout_ms=500)
         self._capture_current_diagram_view_state(source_key)
@@ -10388,10 +10743,10 @@ class MdExploreWindow(QMainWindow):
     style.textContent = `
 @media print {
   @page {
-    size: portrait;
+    size: Letter portrait;
   }
   @page mdexploreLandscape {
-    size: landscape;
+    size: Letter landscape;
   }
   main {
     max-width: none !important;
@@ -10401,6 +10756,8 @@ class MdExploreWindow(QMainWindow):
   }
   .mdexplore-print-block {
     display: block;
+    margin-left: auto !important;
+    margin-right: auto !important;
   }
   .mdexplore-print-block.mdexplore-print-keep {
     break-inside: avoid-page !important;
@@ -10411,6 +10768,19 @@ class MdExploreWindow(QMainWindow):
     page-break-inside: avoid !important;
   }
   .mdexplore-print-block.mdexplore-print-break-before {
+    break-before: page !important;
+    page-break-before: always !important;
+  }
+  .mdexplore-fence.mdexplore-print-break-before {
+    display: block !important;
+    break-before: page !important;
+    page-break-before: always !important;
+  }
+  .mdexplore-print-sequence-page-break {
+    display: block !important;
+    height: 0 !important;
+    margin: 0 !important;
+    padding: 0 !important;
     break-before: page !important;
     page-break-before: always !important;
   }
@@ -10448,7 +10818,12 @@ class MdExploreWindow(QMainWindow):
     break-before: avoid-page;
     page-break-before: avoid;
   }
+  .mdexplore-fence {
+    margin-left: auto !important;
+    margin-right: auto !important;
+  }
   .mdexplore-fence.mdexplore-print-keep {
+    display: inline-block !important;
     break-inside: avoid-page !important;
     page-break-inside: avoid !important;
   }
@@ -10709,17 +11084,13 @@ body.mdexplore-pdf-export-mode .mdexplore-fence {
     if (!(svg instanceof SVGElement)) {
       return;
     }
-    const intrinsic = intrinsicSvgSizeFromNodeForPdf(svg);
     svg.classList.add("plantuml", "mdexplore-plantuml-inline");
     svg.style.removeProperty("transform");
     svg.style.setProperty("display", "block", "important");
-    svg.style.setProperty(
-      "width",
-      intrinsic.width > 0 ? `${Math.floor(intrinsic.width)}px` : "auto",
-      "important",
-    );
-    svg.style.setProperty("max-width", "100%", "important");
-    svg.style.setProperty("height", "auto", "important");
+    svg.style.setProperty("width", "var(--mdexplore-print-diagram-width, auto)", "important");
+    svg.style.setProperty("max-width", "var(--mdexplore-print-diagram-max-width, 100%)", "important");
+    svg.style.setProperty("height", "var(--mdexplore-print-diagram-height, auto)", "important");
+    svg.style.setProperty("max-height", "var(--mdexplore-print-diagram-max-height, none)", "important");
     svg.style.setProperty("margin", "0 auto", "important");
   };
 
@@ -10781,7 +11152,8 @@ body.mdexplore-pdf-export-mode .mdexplore-fence {
         svg.style.removeProperty("width");
         svg.style.setProperty("width", "var(--mdexplore-print-diagram-width, auto)", "important");
         svg.style.setProperty("max-width", "var(--mdexplore-print-diagram-max-width, 100%)", "important");
-        svg.style.setProperty("height", "auto", "important");
+        svg.style.setProperty("height", "var(--mdexplore-print-diagram-height, auto)", "important");
+        svg.style.setProperty("max-height", "var(--mdexplore-print-diagram-max-height, none)", "important");
         host.innerHTML = "";
         host.appendChild(svg);
         continue;
@@ -10830,7 +11202,8 @@ body.mdexplore-pdf-export-mode .mdexplore-fence {
       svg.style.setProperty("display", "block", "important");
       svg.style.setProperty("width", "var(--mdexplore-print-diagram-width, auto)", "important");
       svg.style.setProperty("max-width", "var(--mdexplore-print-diagram-max-width, 100%)", "important");
-      svg.style.setProperty("height", "auto", "important");
+      svg.style.setProperty("height", "var(--mdexplore-print-diagram-height, auto)", "important");
+      svg.style.setProperty("max-height", "var(--mdexplore-print-diagram-max-height, none)", "important");
     }
 
     // Expand regular markdown raster images to full printable content width.
@@ -11082,9 +11455,7 @@ body.mdexplore-pdf-export-mode .mdexplore-fence {
       svgNode.removeAttribute("height");
       svgNode.style.removeProperty("width");
       svgNode.style.removeProperty("max-width");
-      svgNode.style.setProperty("width", "100%", "important");
-      svgNode.style.setProperty("max-width", "100%", "important");
-      svgNode.style.setProperty("height", "auto", "important");
+      svgNode.style.removeProperty("height");
     };
 
     // PDF must not inherit GUI viewport assumptions; re-fit canvas to content.
@@ -11445,27 +11816,54 @@ body.mdexplore-pdf-export-mode .mdexplore-fence {
     viewport.scrollTop = 0;
   }
 
+  // Decide how each diagram section should paginate for PDF output. This pass
+  // is the bridge between DOM content and the later Qt print snapshot: it
+  // classifies sections as portrait/landscape and keep/spill, moves heading
+  // clusters into diagram fences so they paginate as one unit, and records the
+  // resulting layout hints for footer stamping.
   const markDiagramPrintLayout = () => {
-    const HEADING_TO_DIAGRAM_GAP_PX = 16;
-    const MIN_KEEP_SHRINK_RATIO = 0.72;
-    const MIN_PLANTUML_KEEP_SHRINK_RATIO = 0.45;
+    const PRINT_LAYOUT_KNOBS = __MDEXPLORE_PRINT_LAYOUT_KNOBS__;
+    const HEADING_TO_DIAGRAM_GAP_PX = PRINT_LAYOUT_KNOBS.headingToDiagramGapPx;
+    const PRINT_LAYOUT_SAFETY_PX = PRINT_LAYOUT_KNOBS.layoutSafetyPx;
+    // PDF Mermaid shrink floor for one-page fit decisions. This is
+    // intentionally user-tweakable and controls when tall flow/activity
+    // diagrams are allowed to stay on one page instead of spilling.
+    const MIN_PRINT_DIAGRAM_FONT_PT = PRINT_LAYOUT_KNOBS.minPrintDiagramFontPt;
+    const minPrintDiagramFontPx = MIN_PRINT_DIAGRAM_FONT_PT * (4 / 3);
+    const maxPrintDiagramFontPx = PRINT_LAYOUT_KNOBS.maxPrintDiagramFontPt * (4 / 3);
     // PDF page selection must be based on print-page geometry, not the live
     // GUI viewport. The export target is US Letter, so use Letter CSS-pixel
     // dimensions here; otherwise the keep/landscape classifier makes the wrong
     // tradeoffs for wide diagrams and heading orphan control.
-    const letterPortraitWidthPx = 816;
-    const letterPortraitHeightPx = 1056;
-    const letterLandscapeWidthPx = 1056;
-    const letterLandscapeHeightPx = 816;
-    const printableWidthPortrait = Math.max(320, letterPortraitWidthPx - 96);
-    const printableHeightPortrait = Math.max(320, letterPortraitHeightPx - 140);
-    const printableWidthLandscape = Math.max(360, letterLandscapeWidthPx - 96);
-    const printableHeightLandscape = Math.max(260, letterLandscapeHeightPx - 140);
+    const letterPortraitWidthPx = PRINT_LAYOUT_KNOBS.portraitLetterWidthPx;
+    const letterPortraitHeightPx = PRINT_LAYOUT_KNOBS.portraitLetterHeightPx;
+    const letterLandscapeWidthPx = PRINT_LAYOUT_KNOBS.landscapeLetterWidthPx;
+    const letterLandscapeHeightPx = PRINT_LAYOUT_KNOBS.landscapeLetterHeightPx;
+    const printableWidthPortrait = Math.max(
+      PRINT_LAYOUT_KNOBS.portraitMinWidthPx,
+      letterPortraitWidthPx - PRINT_LAYOUT_KNOBS.horizontalMarginPx,
+    );
+    const printableHeightPortrait = Math.max(
+      PRINT_LAYOUT_KNOBS.portraitMinHeightPx,
+      letterPortraitHeightPx - PRINT_LAYOUT_KNOBS.verticalMarginPx,
+    );
+    const printableWidthLandscape = Math.max(
+      PRINT_LAYOUT_KNOBS.landscapeMinWidthPx,
+      letterLandscapeWidthPx - PRINT_LAYOUT_KNOBS.horizontalMarginPx,
+    );
+    const printableHeightLandscape = Math.max(
+      PRINT_LAYOUT_KNOBS.landscapeMinHeightPx,
+      letterLandscapeHeightPx - PRINT_LAYOUT_KNOBS.verticalMarginPx,
+    );
     let diagramCount = 0;
     let keepCount = 0;
     let allowBreakCount = 0;
     let landscapeCount = 0;
+    const landscapeHeadings = [];
+    const diagramHeadings = [];
 
+    // Reset any previous preflight wrappers before recomputing layout. PDF
+    // export retries can run this block more than once.
     const unwrapPrintBlocks = () => {
       for (const block of Array.from(document.querySelectorAll(".mdexplore-print-block[data-mdexplore-print-block='1']"))) {
         if (!(block instanceof HTMLElement)) {
@@ -11482,652 +11880,327 @@ body.mdexplore-pdf-export-mode .mdexplore-fence {
       }
     };
 
-    unwrapPrintBlocks();
-
-    const isSpacerElement = (element) => {
-      if (!(element instanceof HTMLElement)) {
-        return false;
-      }
-      if (element.tagName === "BR") {
-        return true;
-      }
-      if (element.tagName === "P") {
-        const text = String(element.textContent || "").trim();
-        if (text.length > 0) {
-          return false;
-        }
-        const nonBreakChildren = Array.from(element.children).filter(
-          (child) => !(child instanceof HTMLBRElement),
-        );
-        return nonBreakChildren.length === 0;
-      }
-      return false;
+    const parseLength = (value) => {
+      const num = Number.parseFloat(String(value || "").replace(/px$/i, "").trim());
+      return Number.isFinite(num) ? num : 0;
     };
 
-    const previousMeaningfulElement = (start) => {
-      let node = start.previousSibling;
-      while (node) {
-        if (node.nodeType === Node.TEXT_NODE) {
-          if (String(node.textContent || "").trim().length === 0) {
-            node = node.previousSibling;
-            continue;
-          }
-          return null;
-        }
-        if (node.nodeType === Node.COMMENT_NODE) {
-          node = node.previousSibling;
-          continue;
-        }
-        if (node.nodeType === Node.ELEMENT_NODE) {
-          const element = node;
-          if (isSpacerElement(element)) {
-            node = node.previousSibling;
-            continue;
-          }
-          return element instanceof HTMLElement ? element : null;
-        }
-        node = node.previousSibling;
-      }
-      return null;
-    };
-
-    const nextMeaningfulElement = (start) => {
-      let node = start.nextSibling;
-      while (node) {
-        if (node.nodeType === Node.TEXT_NODE) {
-          if (String(node.textContent || "").trim().length === 0) {
-            node = node.nextSibling;
-            continue;
-          }
-          return null;
-        }
-        if (node.nodeType === Node.COMMENT_NODE) {
-          node = node.nextSibling;
-          continue;
-        }
-        if (node.nodeType === Node.ELEMENT_NODE) {
-          const element = node;
-          if (isSpacerElement(element)) {
-            node = node.nextSibling;
-            continue;
-          }
-          return element instanceof HTMLElement ? element : null;
-        }
-        node = node.nextSibling;
-      }
-      return null;
-    };
-
-    const headingLevel = (element) => {
-      if (!(element instanceof HTMLElement)) {
+    const headingLevel = (node) => {
+      if (!(node instanceof HTMLElement)) {
         return 0;
       }
-      const match = /^H([1-6])$/.exec(element.tagName);
+      const match = String(node.tagName || "").match(/^H([1-6])$/i);
       return match ? Number.parseInt(match[1], 10) : 0;
     };
 
-    const headingBeforeFence = (fence) => {
-      const candidate = previousMeaningfulElement(fence);
-      if (!(candidate instanceof HTMLElement)) {
-        return null;
+    const previousMeaningfulElement = (node) => {
+      let current = node ? node.previousSibling : null;
+      while (current) {
+        if (current instanceof HTMLElement) {
+          return current;
+        }
+        if (current instanceof Text && String(current.textContent || "").trim()) {
+          return null;
+        }
+        current = current.previousSibling;
       }
-      return /^H[1-6]$/.test(candidate.tagName) ? candidate : null;
+      return null;
+    };
+
+    const nextMeaningfulElement = (node) => {
+      let current = node ? node.nextSibling : null;
+      while (current) {
+        if (current instanceof HTMLElement) {
+          return current;
+        }
+        if (current instanceof Text && String(current.textContent || "").trim()) {
+          return null;
+        }
+        current = current.nextSibling;
+      }
+      return null;
+    };
+
+    // Heading height is measured against an explicit printable width so orphan
+    // control uses stable numbers instead of live viewport geometry.
+    const stableHeadingHeight = (heading, widthPx) => {
+      if (!(heading instanceof HTMLElement)) {
+        return 0;
+      }
+      const restore = {
+        display: heading.style.getPropertyValue("display"),
+        width: heading.style.getPropertyValue("width"),
+        maxWidth: heading.style.getPropertyValue("max-width"),
+        boxSizing: heading.style.getPropertyValue("box-sizing"),
+        whiteSpace: heading.style.getPropertyValue("white-space"),
+      };
+      heading.style.setProperty("display", "block", "important");
+      if (widthPx > 0) {
+        const widthText = `${Math.round(widthPx)}px`;
+        heading.style.setProperty("width", widthText, "important");
+        heading.style.setProperty("max-width", widthText, "important");
+      }
+      heading.style.setProperty("box-sizing", "border-box", "important");
+      heading.style.setProperty("white-space", "normal", "important");
+      const rect = heading.getBoundingClientRect();
+      const computed = window.getComputedStyle(heading);
+      const marginTop = parseLength(computed.marginTop);
+      const marginBottom = parseLength(computed.marginBottom);
+      const height = Math.max(0, rect.height + marginTop + marginBottom);
+      if (restore.display) {
+        heading.style.setProperty("display", restore.display);
+      } else {
+        heading.style.removeProperty("display");
+      }
+      if (restore.width) {
+        heading.style.setProperty("width", restore.width);
+      } else {
+        heading.style.removeProperty("width");
+      }
+      if (restore.maxWidth) {
+        heading.style.setProperty("max-width", restore.maxWidth);
+      } else {
+        heading.style.removeProperty("max-width");
+      }
+      if (restore.boxSizing) {
+        heading.style.setProperty("box-sizing", restore.boxSizing);
+      } else {
+        heading.style.removeProperty("box-sizing");
+      }
+      if (restore.whiteSpace) {
+        heading.style.setProperty("white-space", restore.whiteSpace);
+      } else {
+        heading.style.removeProperty("white-space");
+      }
+      return height;
     };
 
     const detectMermaidKindForFence = (fence) => {
-      const block = fence.querySelector(".mermaid");
-      if (!(block instanceof HTMLElement)) {
+      if (!(fence instanceof HTMLElement)) {
         return "";
       }
-      const explicitKind = String((block.dataset && block.dataset.mdexploreMermaidKind) || "")
+      const mermaid = fence.querySelector(".mermaid");
+      if (!(mermaid instanceof HTMLElement)) {
+        return "";
+      }
+      const explicitKind = String(mermaid.dataset.mdexploreMermaidKind || "")
         .trim()
         .toLowerCase();
       if (explicitKind) {
         return explicitKind;
       }
-      const sourceText = String(
-        (block.dataset && block.dataset.mdexploreMermaidSource) ||
-          block.getAttribute("data-mdexplore-mermaid-source") ||
-          "",
-      );
-      if (/^\\s*sequenceDiagram\\b/im.test(sourceText)) {
+      const sourceText = String(mermaid.dataset.mdexploreMermaidSource || mermaid.textContent || "");
+      if (/^\s*sequenceDiagram\b/im.test(sourceText)) {
         return "sequence";
       }
-      const svg = block.querySelector("svg");
-      if (svg instanceof SVGElement && svg.querySelector(".messageLine0, .messageLine1, .loopLine, .actor")) {
-        return "sequence";
+      if (/^\s*classDiagram\b/im.test(sourceText)) {
+        return "class";
+      }
+      if (/^\s*erDiagram\b/im.test(sourceText)) {
+        return "er";
+      }
+      if (/^\s*stateDiagram(?:-v2)?\b/im.test(sourceText)) {
+        return "state";
+      }
+      if (/^\s*(?:graph|flowchart)\b/im.test(sourceText)) {
+        return "flowchart";
       }
       return "";
     };
 
-    const parseLength = (value) => {
-      if (!value) return 0;
-      const parsed = Number.parseFloat(String(value));
-      return Number.isFinite(parsed) ? Math.max(0, parsed) : 0;
-    };
-
-    const decodeSvgDataUri = (src) => {
-      const raw = String(src || "");
-      if (!raw.startsWith("data:image/svg+xml")) {
-        return "";
-      }
-      const commaIndex = raw.indexOf(",");
-      if (commaIndex < 0) {
-        return "";
-      }
-      const meta = raw.slice(0, commaIndex).toLowerCase();
-      const payload = raw.slice(commaIndex + 1);
-      try {
-        if (meta.includes(";base64")) {
-          return atob(payload);
-        }
-        return decodeURIComponent(payload);
-      } catch (_error) {
-        return "";
-      }
-    };
-
-    const intrinsicSvgSizeFromMarkup = (markup) => {
-      const text = String(markup || "");
-      if (!text) {
+    // Diagram fit decisions operate on intrinsic SVG/image dimensions rather
+    // than already-scaled CSS boxes so one-page and spill decisions are
+    // reproducible.
+    const intrinsicDiagramSize = (fence) => {
+      if (!(fence instanceof HTMLElement)) {
         return { width: 0, height: 0 };
       }
-      const viewBoxMatch = text.match(/viewBox\\s*=\\s*[\"']\\s*([-+0-9.eE]+)[\\s,]+([-+0-9.eE]+)[\\s,]+([-+0-9.eE]+)[\\s,]+([-+0-9.eE]+)\\s*[\"']/i);
-      if (viewBoxMatch) {
-        const width = Math.abs(Number.parseFloat(viewBoxMatch[3] || "0"));
-        const height = Math.abs(Number.parseFloat(viewBoxMatch[4] || "0"));
-        if (Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0) {
-          return { width, height };
-        }
-      }
-      const widthMatch = text.match(/\\bwidth\\s*=\\s*[\"']\\s*([-+0-9.eE]+)(?:px)?\\s*[\"']/i);
-      const heightMatch = text.match(/\\bheight\\s*=\\s*[\"']\\s*([-+0-9.eE]+)(?:px)?\\s*[\"']/i);
-      const width = widthMatch ? Math.abs(Number.parseFloat(widthMatch[1] || "0")) : 0;
-      const height = heightMatch ? Math.abs(Number.parseFloat(heightMatch[1] || "0")) : 0;
-      if (Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0) {
-        return { width, height };
-      }
-      return { width: 0, height: 0 };
-    };
-
-    const intrinsicPlantUmlSize = (img) => {
-      if (!(img instanceof HTMLImageElement)) {
-        return { width: 0, height: 0 };
-      }
-      if (Number.isFinite(img.naturalWidth) && Number(img.naturalWidth) > 0 &&
-          Number.isFinite(img.naturalHeight) && Number(img.naturalHeight) > 0) {
-        return { width: Number(img.naturalWidth), height: Number(img.naturalHeight) };
-      }
-      const attrWidth = parseLength(img.getAttribute("width"));
-      const attrHeight = parseLength(img.getAttribute("height"));
-      if (attrWidth > 0 && attrHeight > 0) {
-        return { width: attrWidth, height: attrHeight };
-      }
-      const decoded = decodeSvgDataUri(img.currentSrc || img.src || "");
-      return intrinsicSvgSizeFromMarkup(decoded);
-    };
-
-    const intrinsicDiagramMaxFontPx = (fence) => {
-      const svg = fence.querySelector("svg");
-      if (!(svg instanceof SVGElement)) {
-        return 0;
-      }
-      let maxFontPx = 0;
-      const fontNodes = Array.from(svg.querySelectorAll("text, tspan, foreignObject, foreignObject *"));
-      for (const node of fontNodes) {
-        if (!(node instanceof Element)) {
-          continue;
-        }
-        const computedFontPx = parseLength(window.getComputedStyle(node).fontSize || "");
-        if (computedFontPx > maxFontPx) {
-          maxFontPx = computedFontPx;
-        }
-        const attrFontPx = parseLength(node.getAttribute("font-size"));
-        if (attrFontPx > maxFontPx) {
-          maxFontPx = attrFontPx;
-        }
-      }
-      return maxFontPx;
-    };
-
-    const intrinsicDiagramWidth = (fence, measuredWidth) => {
       const svg = fence.querySelector("svg");
       if (svg instanceof SVGElement) {
         const viewBox = String(svg.getAttribute("viewBox") || "").trim();
         if (viewBox) {
-          const parts = viewBox.split(/[\\s,]+/).map((part) => Number.parseFloat(part));
+          const parts = viewBox.split(/[\s,]+/).map((part) => Number.parseFloat(part));
           if (parts.length === 4 && parts.every((num) => Number.isFinite(num))) {
             const width = Math.abs(parts[2]);
-            if (width > 0) {
-              return width;
+            const height = Math.abs(parts[3]);
+            if (width > 0 && height > 0) {
+              return { width, height };
             }
           }
         }
-        const svgWidth = parseLength(svg.getAttribute("width"));
-        if (svgWidth > 0) {
-          return svgWidth;
+        const width = parseLength(svg.getAttribute("width"));
+        const height = parseLength(svg.getAttribute("height"));
+        if (width > 0 && height > 0) {
+          return { width, height };
         }
-      }
-
-      const plantImg = fence.querySelector("img.plantuml");
-      const plantSvg = fence.querySelector("svg.mdexplore-plantuml-inline");
-      if (plantSvg instanceof SVGElement) {
-        const viewBox = String(plantSvg.getAttribute("viewBox") || "").trim();
-        if (viewBox) {
-          const parts = viewBox.split(/[\\s,]+/).map((part) => Number.parseFloat(part));
-          if (parts.length === 4 && parts.every((num) => Number.isFinite(num))) {
-            const width = Math.abs(parts[2]);
-            if (width > 0) {
-              return width;
-            }
+        try {
+          const box = svg.getBBox();
+          if (box && box.width > 0 && box.height > 0) {
+            return { width: box.width, height: box.height };
           }
+        } catch (_error) {
+          // Ignore SVG bbox failures.
         }
       }
-      if (plantImg instanceof HTMLImageElement) {
-        const size = intrinsicPlantUmlSize(plantImg);
-        if (size.width > 0) {
-          return size.width;
+      const img = fence.querySelector("img.plantuml");
+      if (img instanceof HTMLImageElement) {
+        const width = Number(img.naturalWidth || 0);
+        const height = Number(img.naturalHeight || 0);
+        if (width > 0 && height > 0) {
+          return { width, height };
         }
       }
-
-      return measuredWidth;
+      const rect = fence.getBoundingClientRect();
+      return { width: Math.max(0, rect.width), height: Math.max(0, rect.height) };
     };
 
-    const estimateHeadingPrintHeight = (heading, printableWidth) => {
-      if (!(heading instanceof HTMLElement)) {
-        return 0;
-      }
-      const style = window.getComputedStyle(heading);
-      const fontPx = Math.max(10, parseLength(style.fontSize || "") || 24);
-      const linePx = Math.max(fontPx * 1.18, parseLength(style.lineHeight || "") || 0);
-      const marginTop = parseLength(style.marginTop || "");
-      const marginBottom = parseLength(style.marginBottom || "");
-      const horizontalPadding =
-        parseLength(style.paddingLeft || "") +
-        parseLength(style.paddingRight || "") +
-        parseLength(style.borderLeftWidth || "") +
-        parseLength(style.borderRightWidth || "");
-      const availableTextWidth = Math.max(180, printableWidth - horizontalPadding - 24);
-      const rawText = String(heading.textContent || "").replace(/\s+/g, " ").trim();
-      const approxCharsPerLine = Math.max(10, Math.floor(availableTextWidth / Math.max(6, fontPx * 0.58)));
-      const approxLineCount = Math.max(1, Math.ceil(Math.max(1, rawText.length) / approxCharsPerLine));
-      return Math.ceil(linePx * approxLineCount + marginTop + marginBottom);
-    };
-
-    const stableHeadingHeight = (heading, printableWidth) => {
-      if (!(heading instanceof HTMLElement)) {
-        return 0;
-      }
-      const rectHeight = Math.max(0, heading.getBoundingClientRect().height || 0);
-      const scrollHeight = Math.max(0, heading.scrollHeight || 0);
-      const measured = Math.max(rectHeight, scrollHeight);
-      const estimated = estimateHeadingPrintHeight(heading, printableWidth);
-      if (measured <= 0) {
-        return estimated;
-      }
-      if (estimated <= 0) {
-        return measured;
-      }
-      // Hidden/offscreen exports can report absurd heading heights when the
-      // live layout width collapses. Prefer a print-width estimate whenever the
-      // measured value is clearly out of family with the estimated block height.
-      if (measured > estimated * 1.55) {
-        return estimated;
-      }
-      return measured;
-    };
-
-    for (const heading of Array.from(document.querySelectorAll("h1, h2, h3, h4, h5, h6"))) {
-      if (heading instanceof HTMLElement) {
-        heading.classList.remove(
-          "mdexplore-print-heading-anchor",
-          "mdexplore-print-heading-landscape",
-          "mdexplore-print-heading-break-before",
-        );
-      }
-    }
-    for (const rule of Array.from(document.querySelectorAll("hr"))) {
-      if (rule instanceof HTMLElement) {
-        rule.classList.remove("mdexplore-print-skip");
-      }
-    }
-
-    const fences = Array.from(document.querySelectorAll(".mdexplore-fence"));
-    for (const fence of fences) {
+    // Font-size bounds drive the "shrink vs spill" decision. We cap at 12pt
+    // on enlargement and compare against the configurable floor when deciding
+    // whether a one-page shrink remains legible.
+    const maxSvgFontPxForFence = (fence) => {
       if (!(fence instanceof HTMLElement)) {
-        continue;
+        return 12;
       }
-      const hasPlantUml = !!fence.querySelector("img.plantuml, svg.mdexplore-plantuml-inline");
-      const hasMermaid = !!fence.querySelector(".mermaid");
-      if (!hasPlantUml && !hasMermaid) {
-        continue;
+      let maxFontPx = 0;
+      for (const node of Array.from(fence.querySelectorAll("svg text, svg tspan, svg foreignObject, svg foreignObject *"))) {
+        if (!(node instanceof Element)) {
+          continue;
+        }
+        const rawFont =
+          node.getAttribute("font-size") ||
+          (node instanceof HTMLElement || node instanceof SVGElement
+            ? window.getComputedStyle(node).fontSize
+            : "");
+        const fontPx = parseLength(rawFont);
+        if (fontPx > maxFontPx) {
+          maxFontPx = fontPx;
+        }
       }
-      const mermaidKind = hasMermaid ? detectMermaidKindForFence(fence) : "";
-      const isSequenceMermaid = hasMermaid && mermaidKind === "sequence";
-      diagramCount += 1;
-      let printBlock = null;
+      return Math.max(12, maxFontPx);
+    };
+
+    const collectHeadingClusterBeforeFence = (fence) => {
+      const headings = [];
+      let cursor = previousMeaningfulElement(fence);
+      while (cursor instanceof HTMLElement) {
+        const level = headingLevel(cursor);
+        if (level <= 0) {
+          break;
+        }
+        headings.unshift(cursor);
+        cursor = previousMeaningfulElement(cursor);
+      }
+      return headings;
+    };
+
+    const clearFenceLayout = (fence) => {
+      if (!(fence instanceof HTMLElement)) {
+        return;
+      }
       fence.classList.remove(
         "mdexplore-print-keep",
         "mdexplore-print-allow-break",
         "mdexplore-print-landscape-page",
         "mdexplore-print-with-heading",
+        "mdexplore-print-break-before",
       );
-      fence.style.removeProperty("--mdexplore-print-diagram-width");
       fence.style.removeProperty("--mdexplore-print-section-width");
-      fence.style.removeProperty("--mdexplore-print-diagram-max-height");
+      fence.style.removeProperty("--mdexplore-print-diagram-width");
       fence.style.removeProperty("--mdexplore-print-diagram-max-width");
       fence.style.removeProperty("--mdexplore-print-diagram-height");
+      fence.style.removeProperty("--mdexplore-print-diagram-max-height");
       fence.style.removeProperty("--mdexplore-print-diagram-reserved-height");
+      fence.style.removeProperty("width");
+      fence.style.removeProperty("max-width");
       fence.style.removeProperty("min-height");
-      const rect = fence.getBoundingClientRect();
-      const measuredWidth = Math.max(1, rect.width || 0, fence.scrollWidth || 0);
-      const measuredHeight = Math.max(1, rect.height || 0, fence.scrollHeight || 0);
-      const intrinsicWidth = intrinsicDiagramWidth(fence, measuredWidth);
-      const intrinsicHeight = (() => {
-        const svg = fence.querySelector("svg");
-        if (svg instanceof SVGElement) {
-          const viewBox = String(svg.getAttribute("viewBox") || "").trim();
-          if (viewBox) {
-            const parts = viewBox.split(/[\\s,]+/).map((part) => Number.parseFloat(part));
-            if (parts.length === 4 && parts.every((num) => Number.isFinite(num))) {
-              const height = Math.abs(parts[3]);
-              if (height > 0) {
-                return height;
-              }
-            }
-          }
-          const svgHeight = parseLength(svg.getAttribute("height"));
-          if (svgHeight > 0) {
-            return svgHeight;
-          }
+      for (const child of Array.from(fence.children)) {
+        if (!(child instanceof HTMLElement)) {
+          continue;
         }
-        const plantSvg = fence.querySelector("svg.mdexplore-plantuml-inline");
-        if (plantSvg instanceof SVGElement) {
-          const viewBox = String(plantSvg.getAttribute("viewBox") || "").trim();
-          if (viewBox) {
-            const parts = viewBox.split(/[\\s,]+/).map((part) => Number.parseFloat(part));
-            if (parts.length === 4 && parts.every((num) => Number.isFinite(num))) {
-              const height = Math.abs(parts[3]);
-              if (height > 0) {
-                return height;
-              }
-            }
-          }
-          const svgHeight = parseLength(plantSvg.getAttribute("height"));
-          if (svgHeight > 0) {
-            return svgHeight;
-          }
-        }
-        const plantImg = fence.querySelector("img.plantuml");
-        if (plantImg instanceof HTMLImageElement) {
-          const size = intrinsicPlantUmlSize(plantImg);
-          if (size.height > 0) {
-            return size.height;
-          }
-        }
-        return measuredHeight;
-      })();
-      const heading = headingBeforeFence(fence);
-      const printableWidthForHeading = Math.max(printableWidthPortrait, printableWidthLandscape);
-      const headingHeight = stableHeadingHeight(heading, printableWidthForHeading);
-      if (heading instanceof HTMLElement) {
-        const existingWrapper = heading.parentElement;
-        if (
-          existingWrapper instanceof HTMLElement &&
-          existingWrapper.classList.contains("mdexplore-print-block")
-        ) {
-          printBlock = existingWrapper;
-        } else if (heading.parentNode) {
-          printBlock = document.createElement("div");
-          printBlock.className = "mdexplore-print-block";
-          printBlock.dataset.mdexplorePrintBlock = "1";
-          heading.parentNode.insertBefore(printBlock, heading);
-          printBlock.appendChild(heading);
-          printBlock.appendChild(fence);
-        }
-      }
-      let targetBlock = printBlock || fence;
-      if ((hasPlantUml || hasMermaid) && heading instanceof HTMLElement && printBlock instanceof HTMLElement) {
-        // Chromium is willing to split a generic wrapper before a tall
-        // diagram fence, which can strand the heading on the prior page.
-        // Make the fence itself own the heading in print mode so any
-        // break-before/keep decision applies to the combined section.
-        if (heading.parentNode !== fence) {
-          fence.insertBefore(heading, fence.firstChild);
-        }
-        const printParent = printBlock.parentNode;
-        if (printParent) {
-          printParent.insertBefore(fence, printBlock);
-          if (printBlock.parentNode === printParent) {
-            printParent.removeChild(printBlock);
-          }
-        }
-        printBlock = null;
-        targetBlock = fence;
-      }
-      targetBlock.classList.remove("mdexplore-print-break-before");
-      const aspectWidth = Math.max(1, intrinsicWidth || measuredWidth || 1);
-      const aspectHeight = Math.max(1, intrinsicHeight || measuredHeight || 1);
-      const maxSvgFontPx = hasMermaid ? intrinsicDiagramMaxFontPx(fence) : 0;
-      const maxPrintDiagramFontPx = 16;
-      const fontScaleCap =
-        maxSvgFontPx > 0.5
-          ? Math.max(0.25, maxPrintDiagramFontPx / maxSvgFontPx)
-          : Number.POSITIVE_INFINITY;
-      const cappedWidthFromFont =
-        Number.isFinite(fontScaleCap) && fontScaleCap > 0
-          ? Math.max(120, aspectWidth * fontScaleCap)
-          : Number.POSITIVE_INFINITY;
-      const effectiveWidthPortrait = Math.max(
-        120,
-        Math.min(printableWidthPortrait, intrinsicWidth || printableWidthPortrait, cappedWidthFromFont),
-      );
-      const effectiveWidthLandscape = Math.max(
-        120,
-        Math.min(printableWidthLandscape, intrinsicWidth || printableWidthLandscape, cappedWidthFromFont),
-      );
-      const projectedHeightPortrait =
-        Math.max(1, aspectHeight || measuredHeight || 1) * (effectiveWidthPortrait / Math.max(1, aspectWidth || measuredWidth || 1));
-      const projectedHeightLandscape =
-        Math.max(1, aspectHeight || measuredHeight || 1) * (effectiveWidthLandscape / Math.max(1, aspectWidth || measuredWidth || 1));
-      let needsLandscapePage =
-        intrinsicWidth > printableWidthPortrait * 1.02 &&
-        intrinsicWidth <= printableWidthLandscape * 1.02;
-
-      const availableHeightPortrait = Math.max(
-        180,
-        printableHeightPortrait - (headingHeight > 0 ? headingHeight + HEADING_TO_DIAGRAM_GAP_PX : 0),
-      );
-      const availableHeightLandscape = Math.max(
-        180,
-        printableHeightLandscape - (headingHeight > 0 ? headingHeight + HEADING_TO_DIAGRAM_GAP_PX : 0),
-      );
-      const portraitFitScale = Math.min(
-        printableWidthPortrait / Math.max(1, aspectWidth),
-        availableHeightPortrait / Math.max(1, aspectHeight),
-      );
-      const landscapeFitScale = Math.min(
-        printableWidthLandscape / Math.max(1, aspectWidth),
-        availableHeightLandscape / Math.max(1, aspectHeight),
-      );
-
-      // Orphan control: if keeping heading+diagram together fails in portrait
-      // but fits as a single landscape page, flip this one diagram page.
-      if (
-        !needsLandscapePage &&
-        heading instanceof HTMLElement &&
-        projectedHeightPortrait > availableHeightPortrait &&
-        landscapeFitScale > portraitFitScale * 1.05
-      ) {
-        needsLandscapePage = true;
-      }
-
-      if (
-        !needsLandscapePage &&
-        hasMermaid &&
-        (isSequenceMermaid || (aspectWidth / Math.max(1, aspectHeight)) >= 1.55) &&
-        landscapeFitScale > portraitFitScale * 1.08
-      ) {
-        needsLandscapePage = true;
-      }
-
-      if (heading instanceof HTMLElement) {
-        heading.classList.add("mdexplore-print-heading-anchor");
-        targetBlock.classList.add("mdexplore-print-with-heading");
-      }
-
-      // Per-diagram fallback: move only the current diagram to a dedicated
-      // landscape page if it does not fit portrait width but can fit landscape width.
-      if (needsLandscapePage) {
-        targetBlock.classList.add("mdexplore-print-landscape-page");
-        if (heading instanceof HTMLElement && heading.parentNode !== targetBlock) {
-          heading.classList.add("mdexplore-print-heading-landscape");
-        }
-        landscapeCount += 1;
-      }
-
-      const printableHeight = needsLandscapePage ? printableHeightLandscape : printableHeightPortrait;
-      const availableDiagramHeight = Math.max(
-        180,
-        printableHeight - (headingHeight > 0 ? headingHeight + HEADING_TO_DIAGRAM_GAP_PX : 0),
-      );
-      const selectedEffectiveWidth = needsLandscapePage ? effectiveWidthLandscape : effectiveWidthPortrait;
-      fence.style.setProperty("--mdexplore-print-section-width", `${Math.floor(selectedEffectiveWidth)}px`);
-      if (hasMermaid) {
-        const diagramWidthPx = Math.floor(selectedEffectiveWidth);
-        targetBlock.style.setProperty("--mdexplore-print-diagram-width", `${diagramWidthPx}px`);
-        targetBlock.style.setProperty("--mdexplore-print-diagram-max-width", `${diagramWidthPx}px`);
-      } else if (
-        selectedEffectiveWidth < Math.min(aspectWidth, needsLandscapePage ? printableWidthLandscape : printableWidthPortrait) - 1
-      ) {
-        targetBlock.style.setProperty("--mdexplore-print-diagram-max-width", `${Math.floor(selectedEffectiveWidth)}px`);
-      }
-      const projectedHeight = needsLandscapePage ? projectedHeightLandscape : projectedHeightPortrait;
-      let keepDiagram = !isSequenceMermaid;
-      const mermaidLooksTall =
-        hasMermaid &&
-        (
-          (projectedHeight > availableDiagramHeight * 0.86) ||
-          (aspectHeight / aspectWidth >= 0.92) ||
-          (projectedHeight / Math.max(1, printableWidthPortrait) >= 0.86)
+        child.classList.remove(
+          "mdexplore-print-heading-anchor",
+          "mdexplore-print-heading-break-before",
+          "mdexplore-print-heading-landscape",
         );
-      if (mermaidLooksTall) {
-        keepDiagram = false;
       }
-      if (isSequenceMermaid && projectedHeight <= availableDiagramHeight) {
-        // A sequence diagram that already fits on one page should stay in the
-        // keep-together path; otherwise Chromium can leave the heading behind
-        // and push the actual diagram content to the next page.
-        keepDiagram = true;
-      }
-      if (
-        isSequenceMermaid &&
-        heading instanceof HTMLElement &&
-        needsLandscapePage &&
-        projectedHeight <= availableDiagramHeight
-      ) {
-        // Sequence Mermaid gets the same orphan-control behavior as PlantUML:
-        // keep heading+diagram together when a single landscape page can hold both.
-        keepDiagram = true;
-      }
-      if (!isSequenceMermaid && projectedHeight > availableDiagramHeight) {
-        const shrinkRatio = availableDiagramHeight / projectedHeight;
-        const minKeepShrinkRatio = hasPlantUml ? MIN_PLANTUML_KEEP_SHRINK_RATIO : MIN_KEEP_SHRINK_RATIO;
-        if (shrinkRatio >= minKeepShrinkRatio) {
-          targetBlock.style.setProperty("--mdexplore-print-diagram-max-height", `${Math.floor(availableDiagramHeight)}px`);
-          targetBlock.style.setProperty("--mdexplore-print-diagram-height", `${Math.floor(availableDiagramHeight)}px`);
-        } else {
-          keepDiagram = false;
-        }
-      }
+    };
 
-      if (hasPlantUml) {
-        const reservedHeight = Math.min(
-          projectedHeight,
-          keepDiagram ? availableDiagramHeight : availableDiagramHeight,
-        );
-        if (reservedHeight > 1) {
-          fence.style.setProperty(
-            "--mdexplore-print-diagram-reserved-height",
-            `${Math.ceil(reservedHeight)}px`,
-          );
-          fence.style.setProperty("min-height", `${Math.ceil(reservedHeight)}px`, "important");
-        }
+    const addSequenceBreakMarker = (fence) => {
+      if (!(fence instanceof HTMLElement) || !fence.parentNode) {
+        return;
       }
+      const previousSibling = fence.previousSibling;
+      const alreadyMarked =
+        previousSibling instanceof HTMLElement &&
+        previousSibling.classList.contains("mdexplore-print-sequence-page-break");
+      if (alreadyMarked) {
+        return;
+      }
+      const marker = document.createElement("div");
+      marker.className = "mdexplore-print-sequence-page-break";
+      fence.parentNode.insertBefore(marker, fence);
+    };
 
-      if ((hasPlantUml || hasMermaid) && heading instanceof HTMLElement && !keepDiagram && printBlock instanceof HTMLElement) {
-        heading.classList.add("mdexplore-print-heading-anchor");
-        fence.classList.add("mdexplore-print-with-heading");
-        if (heading.parentNode !== fence) {
-          fence.insertBefore(heading, fence.firstChild);
-        }
-        const printParent = printBlock.parentNode;
-        if (printParent) {
-          printParent.insertBefore(fence, printBlock);
-          if (printBlock.parentNode === printParent) {
-            printParent.removeChild(printBlock);
-          }
-        }
-        targetBlock = fence;
+    // Keep-together sections receive explicit width/height CSS variables so
+    // the print snapshot path honors the same geometry this solver chose.
+    const applyKeepSizing = (fence, sectionWidth, diagramWidth, diagramHeight, headingHeight) => {
+      if (!(fence instanceof HTMLElement)) {
+        return;
       }
+      const widthText = `${Math.max(1, Math.round(diagramWidth))}px`;
+      const heightText = `${Math.max(1, Math.round(diagramHeight))}px`;
+      const sectionWidthText = `${Math.max(1, Math.round(sectionWidth))}px`;
+      const reservedHeight = Math.max(1, Math.round(headingHeight + HEADING_TO_DIAGRAM_GAP_PX + diagramHeight));
+      fence.style.setProperty("--mdexplore-print-section-width", sectionWidthText);
+      fence.style.setProperty("--mdexplore-print-diagram-width", widthText);
+      fence.style.setProperty("--mdexplore-print-diagram-max-width", widthText);
+      fence.style.setProperty("--mdexplore-print-diagram-height", heightText);
+      fence.style.setProperty("--mdexplore-print-diagram-max-height", heightText);
+      fence.style.setProperty("--mdexplore-print-diagram-reserved-height", `${reservedHeight}px`);
+    };
 
-      if (keepDiagram) {
-        targetBlock.classList.add("mdexplore-print-keep");
-        keepCount += 1;
-      } else {
-        // Very tall diagrams remain breakable only when unavoidable.
-        targetBlock.classList.add("mdexplore-print-allow-break");
-        allowBreakCount += 1;
-        targetBlock.classList.remove("mdexplore-print-with-heading");
-        if (heading instanceof HTMLElement) {
-          heading.classList.remove("mdexplore-print-heading-anchor", "mdexplore-print-heading-landscape");
-          const contentRoot =
-            document.querySelector("main") ||
-            document.body ||
-            document.documentElement;
-          const contentTop =
-            contentRoot instanceof HTMLElement
-              ? contentRoot.getBoundingClientRect().top + window.scrollY
-              : 0;
-          const targetTop = targetBlock.getBoundingClientRect().top + window.scrollY;
-          const pageHeight = Math.max(180, printableHeight);
-          const relativeTop = Math.max(0, targetTop - contentTop);
-          const pageOffset = relativeTop % pageHeight;
-          if (pageOffset > 1) {
-            // Breakable diagram sections should not strand the heading on the
-            // previous page. Start the whole headed block on a fresh page and
-            // allow the diagram itself to break only after that first page.
-            targetBlock.classList.add("mdexplore-print-break-before");
-          }
-        }
+    // Spillable sections still get an explicit width budget, but height is left
+    // unconstrained so Chromium can paginate through the diagram vertically.
+    const applyBreakSizing = (fence, sectionWidth, diagramWidth) => {
+      if (!(fence instanceof HTMLElement)) {
+        return;
       }
+      const widthText = `${Math.max(1, Math.round(diagramWidth))}px`;
+      const sectionWidthText = `${Math.max(1, Math.round(sectionWidth))}px`;
+      fence.style.setProperty("--mdexplore-print-section-width", sectionWidthText);
+      fence.style.setProperty("--mdexplore-print-diagram-width", widthText);
+      fence.style.setProperty("--mdexplore-print-diagram-max-width", widthText);
+      fence.style.removeProperty("--mdexplore-print-diagram-height");
+      fence.style.removeProperty("--mdexplore-print-diagram-max-height");
+      fence.style.removeProperty("--mdexplore-print-diagram-reserved-height");
+    };
 
-      if (heading instanceof HTMLElement) {
-        const contentRoot =
-          document.querySelector("main") ||
-          document.body ||
-          document.documentElement;
-        const contentTop =
-          contentRoot instanceof HTMLElement
-            ? contentRoot.getBoundingClientRect().top + window.scrollY
-            : 0;
-        const targetTop = targetBlock.getBoundingClientRect().top + window.scrollY;
-        const pageHeight = Math.max(180, printableHeight);
-        const relativeTop = Math.max(0, targetTop - contentTop);
-        const pageOffset = relativeTop % pageHeight;
-        const remainingOnPage = Math.max(0, pageHeight - pageOffset);
-        const projectedBlockHeight = projectedHeight + headingHeight + HEADING_TO_DIAGRAM_GAP_PX;
-        if (pageOffset > 1 && projectedBlockHeight > remainingOnPage + 1) {
-          // Even for keep-together diagrams, move the whole headed section to
-          // the next page when the current page cannot hold the heading plus
-          // the projected diagram. Without this, Chromium can leave the
-          // heading behind and push only the image content.
-          targetBlock.classList.add("mdexplore-print-break-before");
-          if (heading.parentElement !== targetBlock) {
-            heading.classList.add("mdexplore-print-heading-break-before");
-          }
-        }
+    const remainingOnCurrentPage = (targetBlock, printableHeight) => {
+      if (!(targetBlock instanceof HTMLElement)) {
+        return printableHeight;
       }
+      const contentRoot = document.querySelector("main") || document.body || document.documentElement;
+      const contentTop =
+        contentRoot instanceof HTMLElement
+          ? contentRoot.getBoundingClientRect().top + window.scrollY
+          : 0;
+      const targetTop = targetBlock.getBoundingClientRect().top + window.scrollY;
+      const relativeTop = Math.max(0, targetTop - contentTop);
+      const pageOffset = relativeTop % Math.max(180, printableHeight);
+      return {
+        pageOffset,
+        remaining: Math.max(0, printableHeight - pageOffset),
+      };
+    };
+
+    unwrapPrintBlocks();
+    for (const marker of Array.from(document.querySelectorAll(".mdexplore-print-sequence-page-break"))) {
+      if (marker instanceof HTMLElement) {
+        marker.remove();
+      }
+    }
+    for (const fence of Array.from(document.querySelectorAll(".mdexplore-fence"))) {
+      clearFenceLayout(fence);
     }
 
     for (const heading of Array.from(document.querySelectorAll("h1, h2, h3, h4, h5, h6"))) {
@@ -12178,6 +12251,7 @@ body.mdexplore-pdf-export-mode .mdexplore-fence {
         nextBlock.parentNode === heading.parentNode &&
         !(nextBlock.parentElement instanceof HTMLElement &&
           nextBlock.parentElement.classList.contains("mdexplore-print-block")) &&
+        !nextBlock.classList.contains("mdexplore-fence") &&
         !/^H[1-6]$/.test(nextBlock.tagName)
       ) {
         cluster.push(nextBlock);
@@ -12246,10 +12320,184 @@ body.mdexplore-pdf-export-mode .mdexplore-fence {
       wrapper.appendChild(nextBlock);
     }
 
-    return { diagramCount, keepCount, allowBreakCount, landscapeCount };
+    for (const fence of Array.from(document.querySelectorAll(".mdexplore-fence"))) {
+      if (!(fence instanceof HTMLElement)) {
+        continue;
+      }
+      const mermaid = fence.querySelector(".mermaid");
+      const plantuml = fence.querySelector("img.plantuml, svg.mdexplore-plantuml-inline");
+      const hasMermaid = mermaid instanceof HTMLElement;
+      const hasPlantUml = plantuml instanceof Element;
+      if (!hasMermaid && !hasPlantUml) {
+        continue;
+      }
+      // Move any immediately-preceding heading cluster into the fence so the
+      // pagination solver can treat "heading + diagram" as one print section.
+      const headingCluster = collectHeadingClusterBeforeFence(fence);
+      if (headingCluster.length > 0) {
+        for (const heading of headingCluster) {
+          fence.insertBefore(heading, fence.firstChild);
+          heading.classList.add("mdexplore-print-heading-anchor");
+        }
+        fence.classList.add("mdexplore-print-with-heading");
+      }
+
+      const headingNodes = Array.from(fence.children).filter(
+        (child) => child instanceof HTMLElement && headingLevel(child) > 0
+      );
+      const headingText = headingNodes.map((node) => String(node.textContent || "").trim()).filter(Boolean).join(" / ");
+      if (headingText) {
+        diagramHeadings.push(headingText);
+      }
+
+      const size = intrinsicDiagramSize(fence);
+      if (size.width <= 0 || size.height <= 0) {
+        continue;
+      }
+
+      const isSequenceMermaid = hasMermaid && detectMermaidKindForFence(fence) === "sequence";
+      const aspectRatio = size.width / Math.max(1, size.height);
+      const maxFontPx = maxSvgFontPxForFence(fence);
+      const fontCapScale = maxFontPx > 0 ? (maxPrintDiagramFontPx / maxFontPx) : 1;
+
+      const headingHeightPortrait = headingNodes.reduce(
+        (sum, node) => sum + stableHeadingHeight(node, printableWidthPortrait),
+        0,
+      );
+      const headingHeightLandscape = headingNodes.reduce(
+        (sum, node) => sum + stableHeadingHeight(node, printableWidthLandscape),
+        0,
+      );
+
+      const availableHeightPortrait = Math.max(
+        PRINT_LAYOUT_KNOBS.keepMinHeightPx,
+        printableHeightPortrait - headingHeightPortrait - HEADING_TO_DIAGRAM_GAP_PX - PRINT_LAYOUT_SAFETY_PX,
+      );
+      const availableHeightLandscape = Math.max(
+        PRINT_LAYOUT_KNOBS.keepMinHeightPx,
+        printableHeightLandscape - headingHeightLandscape - HEADING_TO_DIAGRAM_GAP_PX - PRINT_LAYOUT_SAFETY_PX,
+      );
+
+      const portraitScale = Math.min(
+        printableWidthPortrait / size.width,
+        availableHeightPortrait / size.height,
+        fontCapScale,
+      );
+      const landscapeScale = Math.min(
+        printableWidthLandscape / size.width,
+        availableHeightLandscape / size.height,
+        fontCapScale,
+      );
+
+      const portraitFontPx = portraitScale * maxFontPx;
+      const landscapeFontPx = landscapeScale * maxFontPx;
+      const canKeepPortrait = portraitScale > 0 && (maxFontPx <= 0 || portraitFontPx >= minPrintDiagramFontPx);
+      const canKeepLandscape = landscapeScale > 0 && (maxFontPx <= 0 || landscapeFontPx >= minPrintDiagramFontPx);
+      const wideLandscapeCandidate =
+        aspectRatio >= PRINT_LAYOUT_KNOBS.wideDiagramAspectRatio &&
+        landscapeScale > (portraitScale * PRINT_LAYOUT_KNOBS.wideDiagramLandscapeGain);
+
+      // Landscape is only selected when it provides a meaningful improvement;
+      // portrait should remain the default so later pages resume normal flow.
+      let useLandscape = false;
+      if (canKeepLandscape && (!canKeepPortrait || wideLandscapeCandidate)) {
+        useLandscape = true;
+      } else if (
+        !canKeepPortrait &&
+        hasPlantUml &&
+        aspectRatio >= PRINT_LAYOUT_KNOBS.plantumlLandscapeAspectRatio &&
+        landscapeScale > portraitScale
+      ) {
+        useLandscape = true;
+      }
+
+      const keepOnOnePage = useLandscape ? canKeepLandscape : (canKeepPortrait || (!useLandscape && canKeepLandscape));
+      const chosenScale =
+        keepOnOnePage
+          ? (useLandscape ? landscapeScale : (canKeepPortrait ? portraitScale : landscapeScale))
+          : Math.min(
+              (useLandscape ? printableWidthLandscape : printableWidthPortrait) / size.width,
+              fontCapScale,
+            );
+      const sectionWidth = useLandscape ? printableWidthLandscape : printableWidthPortrait;
+      const chosenHeadingHeight = useLandscape ? headingHeightLandscape : headingHeightPortrait;
+      const diagramWidth = Math.max(1, Math.round(size.width * chosenScale));
+      const diagramHeight = Math.max(1, Math.round(size.height * chosenScale));
+
+      if (useLandscape) {
+        fence.classList.add("mdexplore-print-landscape-page");
+        if (headingText) {
+          landscapeHeadings.push(headingText);
+        }
+      }
+
+      if (keepOnOnePage) {
+        fence.classList.add("mdexplore-print-keep");
+        applyKeepSizing(fence, sectionWidth, diagramWidth, diagramHeight, chosenHeadingHeight);
+        keepCount += 1;
+      } else {
+        // Once the font floor is reached, preserve width and let Chromium spill
+        // vertically rather than shrinking the diagram into illegibility.
+        fence.classList.add("mdexplore-print-allow-break");
+        applyBreakSizing(fence, sectionWidth, diagramWidth);
+        allowBreakCount += 1;
+      }
+
+      const pageBudget = useLandscape ? printableHeightLandscape : printableHeightPortrait;
+      const pageMetrics = remainingOnCurrentPage(fence, pageBudget);
+      const projectedSectionHeight = chosenHeadingHeight + HEADING_TO_DIAGRAM_GAP_PX + diagramHeight;
+      const shouldBreakBefore =
+        pageMetrics.pageOffset > 1 &&
+        (keepOnOnePage
+          ? projectedSectionHeight > pageMetrics.remaining + 1
+          : headingNodes.length > 0);
+      if (shouldBreakBefore) {
+        fence.classList.add("mdexplore-print-break-before");
+        if (isSequenceMermaid) {
+          addSequenceBreakMarker(fence);
+        }
+      }
+
+      diagramCount += 1;
+      if (useLandscape) {
+        landscapeCount += 1;
+      }
+    }
+
+    return {
+      diagramCount,
+      keepCount,
+      allowBreakCount,
+      landscapeCount,
+      landscapeHeadings: Array.from(new Set(landscapeHeadings)),
+      diagramHeadings: Array.from(new Set(diagramHeadings)),
+    };
   };
 
   const diagramLayout = markDiagramPrintLayout();
+
+  const landscapeTokenText = "__MDEXPLORE_LANDSCAPE_PAGE__";
+  // Landscape decisions are passed back to Python via tiny hidden tokens so
+  // the footer-stamping pass can rotate only those pages after printToPdf().
+  for (const block of Array.from(document.querySelectorAll(".mdexplore-print-landscape-page"))) {
+    if (!(block instanceof HTMLElement)) {
+      continue;
+    }
+    let token = block.querySelector(":scope > .mdexplore-pdf-landscape-token");
+    if (!(token instanceof HTMLElement)) {
+      token = document.createElement("div");
+      token.className = "mdexplore-pdf-landscape-token";
+      token.textContent = landscapeTokenText;
+      token.style.setProperty("display", "block", "important");
+      token.style.setProperty("font-size", "2px", "important");
+      token.style.setProperty("line-height", "2px", "important");
+      token.style.setProperty("margin", "0", "important");
+      token.style.setProperty("padding", "0", "important");
+      token.style.setProperty("color", "#ffffff", "important");
+      token.style.setProperty("pointer-events", "none", "important");
+      block.insertBefore(token, block.firstChild);
+    }
+  }
 
   const hasMath = !!document.querySelector("mjx-container, .MathJax");
   const hasMermaid = !!document.querySelector(".mermaid");
@@ -12279,6 +12527,12 @@ body.mdexplore-pdf-export-mode .mdexplore-fence {
 """
         js = js.replace("__MDEXPLORE_FORCE_MERMAID__", "true" if attempt == 0 else "false")
         js = js.replace("__MDEXPLORE_RESET_MERMAID__", "true" if attempt == 0 else "false")
+        # Keep PDF preflight policy sourced from Python constants so the
+        # embedded JS remains a consumer of print-layout rules, not the owner.
+        js = js.replace(
+            "__MDEXPLORE_PRINT_LAYOUT_KNOBS__",
+            json.dumps(_pdf_print_layout_knobs()),
+        )
         self.preview.page().runJavaScript(
             js,
             lambda result, target=output_path, tries=attempt, key=source_key: self._on_pdf_precheck_result(
@@ -12297,6 +12551,9 @@ body.mdexplore-pdf-export-mode .mdexplore-fence {
             mermaid_ready = bool(result.get("mermaidReady"))
             plantuml_ready = bool(result.get("plantumlReady"))
             fonts_ready = bool(result.get("fontsReady"))
+            diagram_layout = result.get("diagramLayout")
+            if isinstance(diagram_layout, dict):
+                self._pending_pdf_layout_hints = dict(diagram_layout)
 
         if math_ready and mermaid_ready and plantuml_ready and fonts_ready:
             self._trigger_pdf_print(output_path, source_key)
@@ -12373,17 +12630,13 @@ body.mdexplore-pdf-export-mode .mdexplore-fence {
     if (!(svg instanceof SVGElement)) {
       return;
     }
-    const intrinsic = intrinsicSvgSizeFromNodeForPdf(svg);
     svg.classList.add("plantuml", "mdexplore-plantuml-inline");
     svg.style.removeProperty("transform");
     svg.style.setProperty("display", "block", "important");
-    svg.style.setProperty(
-      "width",
-      intrinsic.width > 0 ? `${Math.floor(intrinsic.width)}px` : "auto",
-      "important",
-    );
-    svg.style.setProperty("max-width", "100%", "important");
-    svg.style.setProperty("height", "auto", "important");
+    svg.style.setProperty("width", "var(--mdexplore-print-diagram-width, auto)", "important");
+    svg.style.setProperty("max-width", "var(--mdexplore-print-diagram-max-width, 100%)", "important");
+    svg.style.setProperty("height", "var(--mdexplore-print-diagram-height, auto)", "important");
+    svg.style.setProperty("max-height", "var(--mdexplore-print-diagram-max-height, none)", "important");
     svg.style.setProperty("margin", "0 auto", "important");
   };
 
@@ -12421,6 +12674,33 @@ body.mdexplore-pdf-export-mode .mdexplore-fence {
     document.documentElement.classList.add("mdexplore-pdf-export-mode");
   }
   document.body.classList.add("mdexplore-pdf-export-mode");
+  for (const fence of Array.from(document.querySelectorAll(".mdexplore-fence"))) {
+    if (!(fence instanceof HTMLElement)) {
+      continue;
+    }
+    const sectionWidth = String(fence.style.getPropertyValue("--mdexplore-print-section-width") || "").trim();
+    if (sectionWidth) {
+      fence.dataset.mdexplorePdfSectionWidth = sectionWidth;
+      fence.style.setProperty("width", sectionWidth, "important");
+      fence.style.setProperty("max-width", sectionWidth, "important");
+      fence.style.setProperty("overflow", "visible", "important");
+      for (const child of Array.from(fence.children)) {
+        if (!(child instanceof HTMLElement)) {
+          continue;
+        }
+        const tag = String(child.tagName || "").toLowerCase();
+        if (!/^h[1-6]$/.test(tag)) {
+          continue;
+        }
+        child.dataset.mdexplorePdfHeadingWidth = sectionWidth;
+        child.style.setProperty("display", "block", "important");
+        child.style.setProperty("width", sectionWidth, "important");
+        child.style.setProperty("max-width", sectionWidth, "important");
+        child.style.setProperty("box-sizing", "border-box", "important");
+        child.style.setProperty("white-space", "normal", "important");
+      }
+    }
+  }
   for (const shell of Array.from(document.querySelectorAll(".mdexplore-mermaid-shell"))) {
     if (!(shell instanceof HTMLElement)) {
       continue;
@@ -12447,7 +12727,8 @@ body.mdexplore-pdf-export-mode .mdexplore-fence {
       svg.style.removeProperty("width");
       svg.style.setProperty("width", "var(--mdexplore-print-diagram-width, auto)", "important");
       svg.style.setProperty("max-width", "var(--mdexplore-print-diagram-max-width, 100%)", "important");
-      svg.style.setProperty("height", "auto", "important");
+      svg.style.setProperty("height", "var(--mdexplore-print-diagram-height, auto)", "important");
+      svg.style.setProperty("max-height", "var(--mdexplore-print-diagram-max-height, none)", "important");
       host.innerHTML = "";
       host.appendChild(svg);
       continue;
@@ -12500,7 +12781,8 @@ body.mdexplore-pdf-export-mode .mdexplore-fence {
     svg.style.setProperty("display", "block", "important");
     svg.style.setProperty("width", "var(--mdexplore-print-diagram-width, auto)", "important");
     svg.style.setProperty("max-width", "var(--mdexplore-print-diagram-max-width, 100%)", "important");
-    svg.style.setProperty("height", "auto", "important");
+    svg.style.setProperty("height", "var(--mdexplore-print-diagram-height, auto)", "important");
+    svg.style.setProperty("max-height", "var(--mdexplore-print-diagram-max-height, none)", "important");
   }
   return true;
 })();
@@ -12515,7 +12797,6 @@ body.mdexplore-pdf-export-mode .mdexplore-fence {
                         lambda pdf_data, target=output_path, key=source_key: self._on_pdf_render_ready(
                             target, key, pdf_data
                         ),
-                        _letter_pdf_page_layout(),
                     ),
                 )
             except Exception as exc:
@@ -12535,6 +12816,11 @@ body.mdexplore-pdf-export-mode .mdexplore-fence {
     document.documentElement.classList.remove("mdexplore-pdf-export-mode");
   }
   document.body.classList.remove("mdexplore-pdf-export-mode");
+  for (const token of Array.from(document.querySelectorAll(".mdexplore-pdf-landscape-token"))) {
+    if (token instanceof HTMLElement) {
+      token.remove();
+    }
+  }
   const pdfMermaidOverride = document.getElementById("__mdexplore_pdf_mermaid_light_override");
   if (pdfMermaidOverride && pdfMermaidOverride.parentNode) {
     pdfMermaidOverride.parentNode.removeChild(pdfMermaidOverride);
@@ -12579,6 +12865,20 @@ body.mdexplore-pdf-export-mode .mdexplore-fence {
       continue;
     }
     fence.style.removeProperty("min-height");
+    fence.style.removeProperty("width");
+    fence.style.removeProperty("max-width");
+    fence.style.removeProperty("overflow");
+    delete fence.dataset.mdexplorePdfSectionWidth;
+    for (const child of Array.from(fence.children)) {
+      if (!(child instanceof HTMLElement)) {
+        continue;
+      }
+      delete child.dataset.mdexplorePdfHeadingWidth;
+      child.style.removeProperty("width");
+      child.style.removeProperty("max-width");
+      child.style.removeProperty("box-sizing");
+      child.style.removeProperty("white-space");
+    }
   }
   for (const block of Array.from(document.querySelectorAll(".mdexplore-print-block[data-mdexplore-print-block='1']"))) {
     if (!(block instanceof HTMLElement)) {
@@ -12642,7 +12942,9 @@ body.mdexplore-pdf-export-mode .mdexplore-fence {
             self.statusBar().showMessage(f"PDF export failed: {message}", 5000)
             return
 
-        worker = PdfExportWorker(output_path, raw_pdf)
+        layout_hints = dict(self._pending_pdf_layout_hints)
+        self._pending_pdf_layout_hints = {}
+        worker = PdfExportWorker(output_path, raw_pdf, layout_hints)
         self._active_pdf_workers.add(worker)
         worker.signals.finished.connect(
             lambda path_text, error_text, current_worker=worker, key=source_key: self._on_pdf_export_finished(

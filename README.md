@@ -151,6 +151,71 @@ If `PATH` is omitted for direct run, the same config/home default rule applies.
 - Footer number font size is matched to the document's dominant scaled body text size.
 - Pages are stamped with centered footer numbering as `1 of N`, `2 of N`, etc.
 
+### PDF Layout Tuning
+
+PDF pagination and diagram sizing are controlled by a small group of constants
+near the top of `mdexplore.py`. These are the first settings to adjust if PDF
+output starts making poor keep/spill/landscape choices.
+
+Most important knobs:
+
+- `MIN_PRINT_DIAGRAM_FONT_PT`
+  - Lower bound for the largest font in a diagram when mdexplore tries to keep
+    that diagram on a single page.
+  - Lower it if you want tall diagrams to stay on one page more often.
+  - Raise it if you prefer multi-page spill over small text.
+- `MAX_PRINT_DIAGRAM_FONT_PT`
+  - Upper bound for diagram enlargement in PDF output.
+  - Lower it if diagrams are printing too large.
+  - Raise it cautiously if diagrams look too small even when there is space.
+- `PDF_PRINT_WIDE_DIAGRAM_ASPECT_RATIO`
+  - Aspect-ratio threshold for promoting a diagram to landscape.
+  - Lower it if wide diagrams are not rotating when they should.
+  - Raise it if too many diagrams are switching to landscape.
+- `PDF_PRINT_WIDE_DIAGRAM_LANDSCAPE_GAIN`
+  - Minimum width gain required before landscape is preferred.
+  - Lower it if landscape should be chosen more aggressively.
+  - Raise it if portrait should remain the default more often.
+- `PDF_PRINT_PLANTUML_LANDSCAPE_ASPECT_RATIO`
+  - Separate PlantUML-specific landscape trigger.
+  - Useful because PlantUML often benefits from landscape earlier than Mermaid.
+- `PDF_PRINT_HORIZONTAL_MARGIN_PX`
+- `PDF_PRINT_VERTICAL_MARGIN_PX`
+  - Effective printable margin budget used by the hidden print-layout solver.
+  - Lower them to let diagrams use more page area.
+  - Raise them if output feels cramped against the page edges.
+- `PDF_PRINT_HEADING_TO_DIAGRAM_GAP_PX`
+  - Vertical spacing reserved between a heading cluster and the diagram it governs.
+  - Raise it if headed sections feel visually crowded.
+  - Lower it if headed diagrams are spilling to the next page too eagerly.
+- `PDF_PRINT_LAYOUT_SAFETY_PX`
+  - Extra safety padding used to avoid borderline fits that clip in Chromium.
+  - Lower it if diagrams are being pushed into spill mode too early.
+  - Raise it if “just barely fits” cases are clipping or producing unstable output.
+
+Heuristic guidance:
+
+- If a diagram is being split across pages but you would accept smaller text,
+  lower `MIN_PRINT_DIAGRAM_FONT_PT`.
+- If a diagram is tiny but should clearly be landscape, first adjust
+  `PDF_PRINT_WIDE_DIAGRAM_ASPECT_RATIO` or
+  `PDF_PRINT_WIDE_DIAGRAM_LANDSCAPE_GAIN`.
+- If headings are being orphaned above diagrams, leave the font knobs alone and
+  look instead at the page-geometry and spacing constants.
+- If many diagrams are near the right answer but consistently a little too big
+  or too small, adjust margins before changing font caps.
+
+Recommended workflow when tuning:
+
+1. Change one constant at a time.
+2. Regenerate the specific problematic PDF.
+3. Recheck both the target document and one known-good document.
+4. Prefer small adjustments; many of these settings interact.
+
+The hidden PDF preflight logic consumes these constants through a Python-to-JS
+configuration handoff, so changing the constants in `mdexplore.py` is the
+intended way to tune print behavior.
+
 ## Known TODOs
 
 - Diagram interaction state restore is not yet reliable across document switches:
