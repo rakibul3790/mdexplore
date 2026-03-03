@@ -776,7 +776,10 @@ class ColorizedMarkdownModel(QFileSystemModel):
     COLOR_FILE_NAME = ".mdexplore-colors.json"
     _ICON_SIZE = 16
     _ICON_GAP = 2
-    _GUTTER_WIDTH = (_ICON_SIZE * 2) + (_ICON_GAP * 2)
+    _VIEWS_ICON_SIZE = 13
+    _SEARCH_ICON_SIZE = 8
+    _SEARCH_SLOT_WIDTH = 10
+    _GUTTER_WIDTH = _SEARCH_SLOT_WIDTH + (_ICON_SIZE + _ICON_GAP)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -978,11 +981,17 @@ class ColorizedMarkdownModel(QFileSystemModel):
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
 
         if has_search_match:
-            search_pixmap = self._search_hit_icon.pixmap(self._ICON_SIZE, self._ICON_SIZE)
-            painter.drawPixmap(0, 0, search_pixmap)
+            search_pixmap = self._search_hit_icon.pixmap(
+                self._SEARCH_ICON_SIZE, self._SEARCH_ICON_SIZE
+            )
+            search_x = max(0, (self._SEARCH_SLOT_WIDTH - self._SEARCH_ICON_SIZE) // 2)
+            search_y = max(0, (self._ICON_SIZE - self._SEARCH_ICON_SIZE) // 2)
+            painter.drawPixmap(search_x, search_y, search_pixmap)
         if has_multi_view:
-            views_pixmap = self._views_icon.pixmap(self._ICON_SIZE, self._ICON_SIZE)
-            painter.drawPixmap(self._ICON_SIZE + self._ICON_GAP, 0, views_pixmap)
+            views_pixmap = self._views_icon.pixmap(self._VIEWS_ICON_SIZE, self._VIEWS_ICON_SIZE)
+            views_x = self._SEARCH_SLOT_WIDTH + self._ICON_GAP
+            views_y = max(0, (self._ICON_SIZE - self._VIEWS_ICON_SIZE) // 2)
+            painter.drawPixmap(views_x, views_y, views_pixmap)
 
         icon_pixmap = self._markdown_icon.pixmap(self._ICON_SIZE, self._ICON_SIZE)
         painter.drawPixmap(self._GUTTER_WIDTH, 0, icon_pixmap)
