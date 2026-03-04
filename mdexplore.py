@@ -6586,7 +6586,7 @@ class MdExploreWindow(QMainWindow):
         self._position_restore_overlay()
         self.statusBar().showMessage(self._default_status_text)
         self._gpu_status_label = QLabel("GPU")
-        self._gpu_status_label.setStyleSheet("color: #9ca3af;")
+        self._gpu_status_label.setStyleSheet("color: rgba(156, 163, 175, 0.45);")
         self._gpu_status_label.setVisible(self._gpu_context_available)
         self.statusBar().addPermanentWidget(self._gpu_status_label)
         backend_warning = self.renderer.mermaid_backend_warning()
@@ -13150,12 +13150,6 @@ def main() -> int:
         print(f"Path is not a directory: {root}", file=sys.stderr)
         return 2
 
-    # Prefer GPU by default; only force software rendering if no OpenGL context
-    # can be created before QApplication initialization.
-    gpu_context_available = _gpu_context_available()
-    if not gpu_context_available:
-        _configure_qt_graphics_fallback()
-
     app = QApplication(sys.argv)
     app.setApplicationName("mdexplore")
     # Explicit desktop file name improves Linux shell mapping between the
@@ -13163,6 +13157,9 @@ def main() -> int:
     app.setDesktopFileName("mdexplore")
     app_icon = _build_markdown_icon()
     app.setWindowIcon(app_icon)
+    # Probe after QApplication is initialized so the result reflects the active
+    # Qt runtime/platform setup used by this process.
+    gpu_context_available = _gpu_context_available()
     window = MdExploreWindow(
         root,
         app_icon,
