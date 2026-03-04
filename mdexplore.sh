@@ -205,8 +205,7 @@ configure_mermaid_rs_override() {
 
 configure_qt_graphics_fallback() {
   # Some desktop/driver combinations fail to create an OpenGL context for
-  # QtWebEngine. Prefer software rendering defaults unless the user has
-  # explicitly configured these variables.
+  # QtWebEngine. Apply software settings only in fallback mode.
   if [[ -z "${QT_QUICK_BACKEND:-}" ]]; then
     export QT_QUICK_BACKEND="software"
     echo "Using QT_QUICK_BACKEND=software"
@@ -375,7 +374,6 @@ fi
 
 configure_local_renderer_overrides
 configure_mermaid_rs_override
-configure_qt_graphics_fallback
 
 # Default to Rust Mermaid renderer for launcher-driven debugging, unless the
 # caller explicitly selected a backend on the command line.
@@ -388,12 +386,23 @@ if [[ "${NON_INTERACTIVE}" -eq 1 ]]; then
   trim_log_file_inplace "${LOG_FILE}" "${MAX_LOG_LINES}"
 fi
 
-if [[ -n "${TARGET_PATH}" ]]; then
-  echo "Launching mdexplore for: ${TARGET_PATH}"
+launch_mdexplore() {
   # Do not override argv[0] for python; it can break venv detection and
   # cause imports to resolve against system packages.
-  exec "${VENV_PYTHON}" "${APP_FILE}" "${APP_ARGS[@]}" "${TARGET_PATH}"
-else
-  echo "Launching mdexplore using configured default root (or home)"
-  exec "${VENV_PYTHON}" "${APP_FILE}" "${APP_ARGS[@]}"
+  if [[ -n "${TARGET_PATH}" ]]; then
+    echo "Launching mdexplore for: ${TARGET_PATH}"
+    "${VENV_PYTHON}" "${APP_FILE}" "${APP_ARGS[@]}" "${TARGET_PATH}"
+  else
+    echo "Launching mdexplore using configured default root (or home)"
+    "${VENV_PYTHON}" "${APP_FILE}" "${APP_ARGS[@]}"
+  fi
+}
+
+# Prefer GPU on first launch, then retry once with software rendering fallback.
+if launch_mdexplore; then
+  exit 0
 fi
+
+echo "Initial launch failed; retrying with software rendering fallback..."
+configure_qt_graphics_fallback
+launch_mdexplore

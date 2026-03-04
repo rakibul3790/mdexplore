@@ -26,7 +26,7 @@ from pathlib import Path
 from markdown_it import MarkdownIt
 from mdit_py_plugins.dollarmath import dollarmath_plugin
 from PySide6.QtCore import QDir, QEventLoop, QMarginsF, QMimeData, QObject, QPoint, QRunnable, QSize, Qt, QThreadPool, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QBrush, QClipboard, QColor, QFont, QIcon, QImage, QPainter, QPageLayout, QPageSize, QPalette, QPen, QPixmap, QPolygon
+from PySide6.QtGui import QAction, QBrush, QClipboard, QColor, QFont, QIcon, QImage, QOffscreenSurface, QOpenGLContext, QPainter, QPageLayout, QPageSize, QPalette, QPen, QPixmap, QPolygon, QSurfaceFormat
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWebEngineCore import QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -127,7 +127,7 @@ def _letter_pdf_page_layout() -> QPageLayout:
 
 
 def _configure_qt_graphics_fallback() -> None:
-    """Prefer software rendering defaults when GPU context creation is unstable."""
+    """Force software rendering env vars for fallback launch paths."""
     if not os.environ.get("QT_QUICK_BACKEND"):
         os.environ["QT_QUICK_BACKEND"] = "software"
     if not os.environ.get("QSG_RHI_BACKEND"):
@@ -137,6 +137,37 @@ def _configure_qt_graphics_fallback() -> None:
     chromium_flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
     if "--disable-gpu" not in chromium_flags.split():
         os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = f"{chromium_flags} --disable-gpu".strip()
+
+
+def _gpu_context_available() -> bool:
+    """Return whether a usable GPU OpenGL context can be created."""
+    qt_quick_backend = os.environ.get("QT_QUICK_BACKEND", "").strip().lower()
+    qsg_rhi_backend = os.environ.get("QSG_RHI_BACKEND", "").strip().lower()
+    qt_opengl = os.environ.get("QT_OPENGL", "").strip().lower()
+    chromium_flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "").split()
+
+    if qt_quick_backend == "software" or qsg_rhi_backend == "software" or qt_opengl == "software":
+        return False
+    if "--disable-gpu" in chromium_flags:
+        return False
+
+    try:
+        surface = QOffscreenSurface()
+        surface.setFormat(QSurfaceFormat.defaultFormat())
+        surface.create()
+        if not surface.isValid():
+            return False
+
+        context = QOpenGLContext()
+        context.setFormat(surface.format())
+        if not context.create():
+            return False
+        if not context.makeCurrent(surface):
+            return False
+        context.doneCurrent()
+        return True
+    except Exception:
+        return False
 
 
 def _pdf_print_layout_knobs() -> dict[str, float | int]:
@@ -6229,7 +6260,14 @@ class MdExploreWindow(QMainWindow):
         ("Red", "#ef7d7d"),
     ]
 
-    def __init__(self, root: Path, app_icon: QIcon, config_path: Path, mermaid_backend: str = MERMAID_BACKEND_JS):
+    def __init__(
+        self,
+        root: Path,
+        app_icon: QIcon,
+        config_path: Path,
+        mermaid_backend: str = MERMAID_BACKEND_JS,
+        gpu_context_available: bool = False,
+    ):
         super().__init__()
         # Persistent document/session state is split deliberately:
         # - cache: rendered HTML keyed by file + stat signature
@@ -6313,6 +6351,7 @@ class MdExploreWindow(QMainWindow):
         self._diagram_state_capture_timer.timeout.connect(self._on_diagram_state_capture_tick)
         self._diagram_state_capture_timer.start()
         self._default_status_text = "Ready"
+        self._gpu_context_available = bool(gpu_context_available)
         self._status_idle_timer = QTimer(self)
         self._status_idle_timer.setInterval(900)
         self._status_idle_timer.timeout.connect(self._ensure_non_empty_status_message)
@@ -6546,6 +6585,10 @@ class MdExploreWindow(QMainWindow):
         self._restore_overlay.hide()
         self._position_restore_overlay()
         self.statusBar().showMessage(self._default_status_text)
+        self._gpu_status_label = QLabel("GPU")
+        self._gpu_status_label.setStyleSheet("color: #9ca3af;")
+        self._gpu_status_label.setVisible(self._gpu_context_available)
+        self.statusBar().addPermanentWidget(self._gpu_status_label)
         backend_warning = self.renderer.mermaid_backend_warning()
         if backend_warning:
             self.statusBar().showMessage(
@@ -13081,8 +13124,6 @@ body.mdexplore-pdf-export-mode .mdexplore-fence {
 
 
 def main() -> int:
-    _configure_qt_graphics_fallback()
-
     parser = argparse.ArgumentParser(
         prog="mdexplore",
         description="Browse and preview markdown files with rich rendering.",
@@ -13109,6 +13150,12 @@ def main() -> int:
         print(f"Path is not a directory: {root}", file=sys.stderr)
         return 2
 
+    # Prefer GPU by default; only force software rendering if no OpenGL context
+    # can be created before QApplication initialization.
+    gpu_context_available = _gpu_context_available()
+    if not gpu_context_available:
+        _configure_qt_graphics_fallback()
+
     app = QApplication(sys.argv)
     app.setApplicationName("mdexplore")
     # Explicit desktop file name improves Linux shell mapping between the
@@ -13116,12 +13163,12 @@ def main() -> int:
     app.setDesktopFileName("mdexplore")
     app_icon = _build_markdown_icon()
     app.setWindowIcon(app_icon)
-
     window = MdExploreWindow(
         root,
         app_icon,
         _config_file_path(),
         mermaid_backend=str(args.mermaid_backend or MERMAID_BACKEND_JS),
+        gpu_context_available=gpu_context_available,
     )
     window.show()
     return app.exec()
